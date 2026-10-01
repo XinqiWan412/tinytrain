@@ -2,8 +2,16 @@ from tokenizer import render_answer, render_prompt, enc
 import random
 
 
+SEED = 400
+N_TEST = 500
+
+
+def make_question(a, b):
+    return f"What is {a} + {b}?"
+
+
 def build_example(a, b):
-    question = f"What is {a} + {b}?"
+    question = make_question(a, b)
     answer = str(a + b)
     prompt = render_prompt(question)
     P = len(prompt)
@@ -15,6 +23,7 @@ def build_example(a, b):
 
 
 def split_pairs(seed, n_test=500):
+    # 返回的是数字对的 list，例如 [(1, 2), (23, 41)]
     pairs = []
     for a in range(100):
         for b in range(100):
@@ -25,8 +34,8 @@ def split_pairs(seed, n_test=500):
 
 
 if __name__ == "__main__":
-    n_test = 500
-    train, test = split_pairs(400, n_test)
+    n_test = N_TEST
+    train, test = split_pairs(SEED, n_test)
     assert len(train) == 10000 - n_test and len(test) == n_test
     assert not set(train) & set(test)  # train 和 test 不能有交集
 

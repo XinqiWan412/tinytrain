@@ -13,12 +13,17 @@ def generate(model: ModelForCausalLM, idx, max_new_tokens, temperature, top_k):
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 logits, _ = model(idx_cond)  # (B, T, V)
             logits = logits[:, -1, :]  # 取序列里最后一个位置
-            logits = logits.to(torch.float32)
-            logits = logits / temperature
-            v, ix = torch.topk(logits, top_k, dim=1)  # (B, k)
-            logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))  # 只保留前 k 大，其余置为 -inf
-            probs = F.softmax(logits, dim=-1)  # (B, V)
-            new_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            logits = logits.to(torch.float32)  # (B, V)
+            if temperature != 0:
+                # 正常采样
+                logits = logits / temperature
+                v, ix = torch.topk(logits, top_k, dim=1)  # (B, k)
+                logits = logits.masked_fill(logits < v[:, [-1]], float("-inf"))  # 只保留前 k 大，其余置为 -inf
+                probs = F.softmax(logits, dim=-1)  # (B, V)
+                new_token = torch.multinomial(probs, num_samples=1)  # (B, 1)
+            else:
+                # temperatrue 为 0，贪心解码
+                new_token = logits.argmax(dim=-1, keepdim=True)
             idx = torch.cat([idx, new_token], dim=-1)
     return idx
 
@@ -38,7 +43,7 @@ if __name__ == "__main__":
     ids = ids.repeat(5, 1)  # dim=0 复制 5 份，dim=1 复制 1 份
 
     # 调用推理
-    temperature, top_k, max_new_tokens = 1.0, 50, 100
+    temperature, top_k, max_new_tokens = 0.0, 50, 100
     ids = generate(model, ids, max_new_tokens, temperature, top_k)
 
     # 解码
