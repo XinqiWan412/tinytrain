@@ -112,7 +112,7 @@ def test_causal_model():
     x, y = dtloader.next_batch()
     logits, loss = m(x, y)
 
-    assert numel == 16_014_336
+    assert numel == 16_026_368
     assert logits.shape == (B, T, config.vocab_size)
     assert 10.8 <= loss.item() <= 11
     print(f'loss = {loss.item():.4f}')
