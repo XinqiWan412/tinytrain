@@ -3,6 +3,7 @@ from sft_data import split_pairs, make_question, SEED, N_TEST
 from tokenizer import render_prompt, enc, IM_END
 from model import ModelForCausalLM, load_model
 from generate import generate
+import argparse
 
 
 def evaluate_accuracy(model: ModelForCausalLM, pairs, B, device):
@@ -52,6 +53,10 @@ def evaluate_accuracy(model: ModelForCausalLM, pairs, B, device):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", default="checkpoints/sft.pt")
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     # 拿到 500 个 test 题
     train, test = split_pairs(SEED, N_TEST)
@@ -62,7 +67,7 @@ if __name__ == "__main__":
         lengths.add(len(prompt))
     assert len(lengths) == 1, f"prompt 长度不一致：{lengths}"
 
-    model = load_model("checkpoints/sft.pt", device)
+    model = load_model(args.ckpt, device)
     model.eval()
     accuracy = evaluate_accuracy(model, test, 100, device)
     print(f"accuracy rate={accuracy}")

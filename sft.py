@@ -2,8 +2,9 @@ import torch
 import random
 from tokenizer import enc
 from dataclasses import asdict
+import argparse
 
-from sft_data import build_example, split_pairs
+from sft_data import build_example, split_pairs, SEED, N_TEST
 from model import load_model
 from pretrain import TrainConfig, configure_optimizer, get_lr
 
@@ -74,6 +75,11 @@ def evaluate(model, test, B, device):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max_steps", type=int, default=2000)
+    parser.add_argument("--out", default="checkpoints/sft.pt")
+    args = parser.parse_args()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     path = "checkpoints/final.pt"
@@ -85,13 +91,13 @@ if __name__ == "__main__":
         max_lr=3e-4,
         min_lr=3e-5,
         warmup_steps=50,
-        max_steps=2000,
+        max_steps=args.max_steps,
         eval_interval=100,
     )
     optimizer = configure_optimizer(m, train_config)  # 加载优化器
-    n_test, B = 500, 128
-    train, test = split_pairs(400, n_test)  # 取 pairs
-    sftloader = SFTLoader(train, B, device, 400)
+    B = 128
+    train, test = split_pairs(SEED, N_TEST)  # 取 pairs
+    sftloader = SFTLoader(train, B, device, SEED)
 
     # 训练
     for step in range(train_config.max_steps):
@@ -112,7 +118,7 @@ if __name__ == "__main__":
             print(f"step={step}, val_loss={val_loss:.4f}")
     
     # 保存
-    save_path = "checkpoints/sft.pt"
+    save_path = args.out
     checkpoint = {
         "model": m.state_dict(),
         "model_config": asdict(m.config),
