@@ -21,7 +21,7 @@ def evaluate_accuracy(model: ModelForCausalLM, pairs, B, device):
         x = torch.tensor(prompts, dtype=torch.long, device=device)  # (B, T)
         y = generate(model, x, max_new_tokens=5, temperature=0, top_k=None)  # 贪心不用 top_k；新生成 5 个 token
 
-        # 取出新生成的 5 个 toekn，答案就在里面
+        # 取出新生成的 5 个 token，答案就在里面
         T = x.shape[1]
         out = y[:, T:].tolist()  # (B, 5)
 
@@ -29,7 +29,7 @@ def evaluate_accuracy(model: ModelForCausalLM, pairs, B, device):
         for row, (a, b) in zip(out, part_pairs):
             if IM_END in row:
                 idx = row.index(IM_END)
-                row = row[:idx]
+                row = row[:idx]  # 把包含 IM_END 在内的后续 token 删掉
             text = enc.decode(row)
             # 提取答案
             try:
