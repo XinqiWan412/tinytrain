@@ -3,5 +3,6 @@ checkpoints/
 
 __pycache__/
 *.pyc
+*.log
 
 .vscode/
