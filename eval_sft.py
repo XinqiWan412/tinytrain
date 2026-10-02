@@ -1,5 +1,5 @@
 import torch
-from sft_data import split_pairs, make_question, SEED, N_TEST
+from sft_data import split_pairs, make_question, SEED, N_TEST, parse_answer
 from tokenizer import render_prompt, enc, IM_END
 from model import ModelForCausalLM, load_model
 from generate import generate
@@ -28,27 +28,19 @@ def evaluate_accuracy(model: ModelForCausalLM, pairs, B, device):
 
         # 逐行验证答案
         for row, (a, b) in zip(out, part_pairs):
-            if IM_END in row:
-                idx = row.index(IM_END)
-                row = row[:idx]  # 把包含 IM_END 在内的后续 token 删掉
-            text = enc.decode(row)
-            # 提取答案
-            try:
-                ans = int(text.strip())
-            except ValueError:
-                ans = None
+            ans = parse_answer(row)  # 提取答案
             # 如果答对，计数加一
             if ans == a + b:
                 count += 1
-            # 答错把 (a, b, text) 存入错题列表
+            # 答错把 (a, b, ans) 存入错题列表
             else:
-                wrong_answer.append((a, b, text))
+                wrong_answer.append((a, b, ans))
 
     # 打印错题表的前 10 条
     n = min(10, len(wrong_answer))
     for i in range(n):
-        a, b, text = wrong_answer[i]
-        print(f"{a} + {b} = {repr(text)}（正确 {a + b}）")
+        a, b, ans = wrong_answer[i]
+        print(f"{a} + {b} = {ans}（正确 {a + b}）")
     return count / len(pairs)  # 返回正确率
 
 
