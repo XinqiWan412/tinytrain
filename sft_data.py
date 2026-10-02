@@ -10,16 +10,20 @@ def make_question(a, b):
     return f"What is {a} + {b}?"
 
 
-def build_example(a, b):
-    question = make_question(a, b)
-    answer = str(a + b)
-    prompt = render_prompt(question)
-    P = len(prompt)
-    ids = prompt + render_answer(answer)
+def build_xy(prompt_ids, completion_ids):
+    P = len(prompt_ids)
+    ids = prompt_ids + completion_ids
     x = ids[:-1]
     y = ids[1:]
     y[:P-1] = [-100] * (P - 1)
     return x, y
+
+
+def build_example(a, b):
+    question = make_question(a, b)
+    prompt = render_prompt(question)
+    answer = str(a + b)
+    return build_xy(prompt, render_answer(answer))
 
 
 def split_pairs(seed, n_test=500):

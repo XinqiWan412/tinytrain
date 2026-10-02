@@ -6,7 +6,7 @@ from generate import generate
 import argparse
 
 
-def evaluate_accuracy(model: ModelForCausalLM, pairs, B, device):
+def evaluate_accuracy(model: ModelForCausalLM, pairs, B, device, show_wrong=True):
     # 对于 a + b 计算题，用 generate 推理出答案，并计算正确率
     count, wrong_answer = 0, []
     for i in range(0, len(pairs), B):
@@ -37,10 +37,11 @@ def evaluate_accuracy(model: ModelForCausalLM, pairs, B, device):
                 wrong_answer.append((a, b, ans))
 
     # 打印错题表的前 10 条
-    n = min(10, len(wrong_answer))
-    for i in range(n):
-        a, b, ans = wrong_answer[i]
-        print(f"{a} + {b} = {ans}（正确 {a + b}）")
+    if show_wrong:
+        n = min(10, len(wrong_answer))
+        for i in range(n):
+            a, b, ans = wrong_answer[i]
+            print(f"{a} + {b} = {ans}（正确 {a + b}）")
     return count / len(pairs)  # 返回正确率
 
 
