@@ -18,13 +18,13 @@ def write_shard(buf, shard_idx, out_dir):
 
 
 def prepare_data(path, out_dir):
-    # 输入parquet，用分词器切成token，dtype=uint16，输出.bin文件
-    batch_size = 2000
+    # 输入 parquet，用分词器切成 token，dtype=uint16，输出 .bin 文件
+    batch_size = 2000  # 一次从 .parquet 文件中读 2000 行
     pf = pq.ParquetFile(path)
     f = pf.iter_batches(batch_size=batch_size, columns=['text'])
-    enc = tiktoken.get_encoding("gpt2")
+    enc = tiktoken.get_encoding("gpt2")  # 加载分词器
     buf, count = [], 0
-    val_size, shard_size, shard_idx = 10_000_000, 100_000_000, 0
+    val_size, shard_size, shard_idx = 10_000_000, 100_000_000, 0  # val 和 train 的 shard 尺寸不一样
     os.makedirs(out_dir, exist_ok=True)
     n_batches = (pf.metadata.num_rows + batch_size - 1) // batch_size
     shards = []
@@ -38,11 +38,13 @@ def prepare_data(path, out_dir):
             count += len(arr)
             limit = val_size if shard_idx == 0 else shard_size
             if count >= limit:
+                # 每满 size 个 token，就写成一个 shard（.bin）文件
                 shards.append(write_shard(buf, shard_idx, out_dir))
                 shard_idx += 1
                 buf, count = [], 0
     
     if buf:
+        # 最后还有一片 shard 要塞进去
         shards.append(write_shard(buf, shard_idx, out_dir))
     meta = {
         "tokenizer": "gpt2",
