@@ -5,10 +5,11 @@ import torch.nn.functional as F
 from generate import generate
 from model import ModelForCausalLM, load_model
 from sft_data import build_xy, split_pairs, SEED, N_TEST, make_question, parse_answer
-from tokenizer import render_prompt, IM_END, enc
+from tokenizer import render_prompt, IM_END
 from sft import collate
 from pretrain import TrainConfig, configure_optimizer, get_lr
 from eval_sft import evaluate_accuracy
+from collections import defaultdict
 
 
 def rollout(model: ModelForCausalLM, pairs, G, device):
@@ -17,29 +18,44 @@ def rollout(model: ModelForCausalLM, pairs, G, device):
     # responses 是 list[list[int]]，装的推理输出的 token id（含im_end）
     # rewards 是得分，正确 1，错误 0，一维 tensor，(B*G,)
     # advantages 是优势，一维tensor，(B*G,)
+
+    # 按长度对 pairs 分组
+    pairs_by_len = defaultdict(list)
     prompts = []
-    for a, b in pairs:
+    for idx, (a, b) in enumerate(pairs):
         question = make_question(a, b)
         prompt = render_prompt(question)
         prompts.append(prompt)
-    x = torch.tensor(prompts, dtype=torch.long, device=device)  # (B, T)
-    T = x.shape[1]
-    x = x.repeat_interleave(G, dim=0)  # (B*G, T)
-    idx = generate(model, x, max_new_tokens=5, temperature=1.0, top_k=None)  # (B*G, T + max_new_tokens)
-    idx = idx[:, T:]  # 取出新生成的 token，(B*G, max_new_tokens)
-    idx = idx.tolist()
+        pairs_by_len[len(prompt)].append(idx)
+
+    # 分组进行 rollout
+    responses = [None] * (len(pairs) * G)
+    for group in pairs_by_len.values():
+        # 调用 generate 批量推理
+        group_prompts = [prompts[idx] for idx in group]
+        x = torch.tensor(group_prompts, dtype=torch.long, device=device)  # (n, T)
+        T = x.shape[1]
+        x = x.repeat_interleave(G, dim=0)  # (n*G, T)
+        out_token = generate(model, x, max_new_tokens=5, temperature=1.0, top_k=None)  # (n*G, T + max_new_tokens)
+        out_token = out_token[:, T:]  # 取出新生成的 token，(n*G, max_new_tokens)
+        out_token = out_token.tolist()
+        for k, row in enumerate(out_token):
+            j = k // G  # 第几道题
+            g = k % G  # 第几个采样回答
+            i = group[j]  # 这道题在 pairs 里的下标
+            # 截输出的 IM_END，存入 responses
+            if IM_END in row:
+                im_end_idx = row.index(IM_END)
+                responses[i*G+g] = row[:im_end_idx + 1]  # IM_END 也保留
+            else:
+                responses[i*G+g] = row  # 没有 IM_END，就保留全部
 
     # 打分
-    responses, rewards = [], []
-    for i, row in enumerate(idx):
-        # 截输出的 IM_END，存入 responses
-        if IM_END in row:
-            im_end_idx = row.index(IM_END)
-            responses.append(row[:im_end_idx + 1])  # IM_END 也保留
-        else:
-            responses.append(row)  # 没有 IM_END，就保留全部
+    assert all(res is not None for res in responses)
+    rewards = []
+    for k, row in enumerate(responses):
         # 打分
-        a, b = pairs[i // G]
+        a, b = pairs[k // G]
         if parse_answer(row) == a + b:
             rewards.append(1.0)
         else:
@@ -105,13 +121,6 @@ def compute_loss(model: ModelForCausalLM, prompts, responses, advantages, G, dev
 
 if __name__ == "__main__":
     train, test = split_pairs(SEED, N_TEST)
-    lengths = set()
-    # 验证 train 全部等长
-    for a, b in train:
-        question = make_question(a, b)
-        prompt = render_prompt(question)
-        lengths.add(len(prompt))
-    assert len(lengths) == 1, f"prompt 长度不一致：{lengths}"
 
     # 创建模型
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -134,7 +143,7 @@ if __name__ == "__main__":
         max_lr=2e-5,
         min_lr=2e-6,
         warmup_steps=20,
-        max_steps=50,
+        max_steps=500,
         eval_interval=50,
     )
     optimizer = configure_optimizer(model, train_config)
@@ -166,15 +175,15 @@ if __name__ == "__main__":
         mixed_ratio = mixed.to(torch.float32).mean()
         print(f"step:{step+1}, rewards_avg:{rewards.mean():.4f}, mixed_ratio:{mixed_ratio.item():.4f}, loss:{loss.item():.4f}, kl:{kl.item():.2e}")
         # 定期用测试集评估
-        if step % train_config.eval_interval == 0 or step == train_config.max_steps - 1:
+        if (step + 1) % train_config.eval_interval == 0:
             model.eval()
             accuracy_rate = evaluate_accuracy(model, test, 100, device, show_wrong=False)
             print(f"step:{step+1}, accuracy_rate:{accuracy_rate:.4f}")
 
-    # # 保存模型
-    # save_path = "checkpoints/grpo_kl02.pt"
-    # checkpoint = {
-    #     "model": model.state_dict(),
-    #     "model_config": asdict(model.config),
-    # }
-    # torch.save(checkpoint, save_path)
+    # 保存模型
+    save_path = "checkpoints/grpo_kl02.pt"
+    checkpoint = {
+        "model": model.state_dict(),
+        "model_config": asdict(model.config),
+    }
+    torch.save(checkpoint, save_path)

@@ -22,8 +22,8 @@ GRPO：不加 KL 时测试准确率持续下滑（33.4% → 25.8%）；加 KL（
 - 模型结构：参考 Qwen3-0.6B，pre-norm、QK-norm、SwiGLU、GQA 等。配置为 hidden 256、4 层、4 头 / 2 KV 头、FFN 768，词表 32768（自训 BPE，含 5 个对话特殊 token），embedding 与 lm_head 共享权重
 - 训练配置：AdamW（betas 0.9/0.95，weight decay 0.1 只加在 2 维参数上），warmup + 余弦衰减，梯度裁剪 1.0，梯度累积，bf16 autocast
 - SFT：只对答案和 `<|im_end|>` 算 loss
-- GRPO：媒体采样 8 次，组内标准化算优势，loss 加对冻结参考模型的 KL 乘法（k3 估计）
-- 
+- GRPO：每题采样 8 次，组内标准化算优势，loss 加对冻结参考模型的 KL 惩罚（k3 估计）
+- 批量生成按 prompt 长度分组（eval_sft.py 和 grpo.py 的 rollout）：数字逐位切分后，prompt 长度随两个加数的位数变化，而同一批生成要求 prompt 等长
 - 对话格式：与 Qwen3 一致
 ```
 <|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{answer}<|im_end|>
@@ -75,17 +75,22 @@ huggingface-cli download HuggingFaceFW/fineweb-edu --repo-type dataset \
 **4. SFT**：`python sft.py`
 - 输入：`checkpoints/final.pt`；题目由 sft_data.py 按 SEED=400 生成，不需要额外数据
 - 输出：`checkpoints/sft.pt`（2000 步）
-- 评估：`python eval_sft.py --ckpt checkpoints/sft.pt`，预期贪心准确率约 92.4%
+- 评估：`python eval_sft.py --ckpt checkpoints/sft.pt`，预期贪心准确率 100%（500 道测试题全对）
+- 对比 v0.1：准确率从 92.4% 提升到 100%。gpt2 把整个和切成一个 token（如"82"），0~198 的每个和都是互不相关的 token，模型只能逐个记；自训 BPE 把数字逐位切开，每一位只需在 10 个数字里选，个位和进位的规律能推广到没见过的题。SFT 的 loss 只在答案和 `<|im_end|>` 上算，两版每道题的 token 数不同，loss 不能直接比
 
 **5. 弱 SFT（GRPO 的起点）**：
-`python sft.py --max_steps 500 --out checkpoints/sft_weak.pt`
-- 预期：`eval_sft.py` 测得约 33.4%
+`python sft.py --max_steps 200 --out checkpoints/sft_weak.pt`
+- 预期：`eval_sft.py` 测得约 37.4%
+- max_steps 从 500 下调到 200：换分词器后 SFT 学得快得多，500 步已远超目标；200 步让起点准确率接近 v0.1 的 33.4%，方便对比 GRPO 的效果
 
 **6. GRPO**：`python grpo.py`
 - 输入：`checkpoints/sft_weak.pt`
 - 输出：`checkpoints/grpo_kl02.pt`
 - 500 步，每 50 步打印一次测试集贪心准确率
-- 预期：结尾约 34.6%
+- 预期：结尾准确率 69.4%，10 次评估平均 59.5%
+- 对比 v0.1（相对各自起点的变化，单位为百分点；起点分别为 33.4% 和 37.4%）：结尾准确率 +1.2 → +32.0，10 次评估平均 −2.8 → +22.1
+- 可能的原因：v0.1 里每个和是一个独立 token，某道题答对得到的奖励只提高那一个 token 的概率，对其他题几乎没有帮助；数字逐位切开后，奖励强化的是所有题共用的逐位相加和进位规则，一道题上的改进能推广到其他题
+
 
 ## 下一步
 训练 BPE 分词器、模型扩大至 1 亿、添加 Muon 优化器、实现多卡并行功能
