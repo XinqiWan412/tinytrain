@@ -1,8 +1,8 @@
 import pyarrow.parquet as pq
-import tiktoken
 import numpy as np
 import os, json
 from tqdm import tqdm
+from tokenizer import enc
 
 
 def write_shard(buf, shard_idx, out_dir):
@@ -22,7 +22,6 @@ def prepare_data(path, out_dir):
     batch_size = 2000  # 一次从 .parquet 文件中读 2000 行
     pf = pq.ParquetFile(path)
     f = pf.iter_batches(batch_size=batch_size, columns=['text'])
-    enc = tiktoken.get_encoding("gpt2")  # 加载分词器
     buf, count = [], 0
     val_size, shard_size, shard_idx = 10_000_000, 100_000_000, 0  # val 和 train 的 shard 尺寸不一样
     os.makedirs(out_dir, exist_ok=True)
@@ -47,7 +46,7 @@ def prepare_data(path, out_dir):
         # 最后还有一片 shard 要塞进去
         shards.append(write_shard(buf, shard_idx, out_dir))
     meta = {
-        "tokenizer": "gpt2",
+        "tokenizer": "tokenizer_32k.json",
         "vocab_size": enc.n_vocab,
         "eot_token": enc.eot_token,
         "dtype": "uint16",
@@ -60,14 +59,13 @@ def prepare_data(path, out_dir):
 def check_data(path):
     # 校验分片是否正确
     m = np.memmap(path, dtype=np.uint16, mode="r")
-    enc = tiktoken.get_encoding("gpt2")
     print(enc.decode(m[:100].tolist()))
-    print((m == 50256).sum())
-    print(m[-1] == 50256)
+    print((m == enc.eot_token).sum())
+    print(m[-1] == enc.eot_token)
 
 
 if __name__ == "__main__":
     data_path = "./data/raw/fineweb-edu/sample/10BT/000_00000.parquet"
-    out_dir = "./data/tokenized/gpt2"
-    # prepare_data(data_path, out_dir)
-    check_data("./data/tokenized/gpt2/val_000000.bin")
+    out_dir = "./data/tokenized/bpe32k"
+    prepare_data(data_path, out_dir)
+    check_data("./data/tokenized/bpe32k/val_000000.bin")
