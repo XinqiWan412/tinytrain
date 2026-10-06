@@ -22,15 +22,15 @@ class DataLoader:
             if not shard['name'].startswith(f"{split}_"):
                 continue
             path = os.path.join(self.data_dir, shard['name'])
-            self.shard_tokens[path] = shard['tokens']  # 把meta里，完整路径对应的tokens信息保存下来
-            names.append(path)  # 完整路径存到names里
+            self.shard_tokens[path] = shard['tokens']  # 把 meta 里，完整路径对应的 tokens 信息保存下来
+            names.append(path)  # 完整路径存到 names 里
         names.sort()
-        self.shards = names  # 存放所有shard文件的路径
+        self.shards = names  # 存放所有 shard 文件的路径
         assert self.shards, f"no shards found for split {split}"
         self.reset()
 
     def _load_shard(self):
-        # 把shard_idx对应的shard读入self.tokens
+        # 把 shard_idx 对应的 shard 读入 self.tokens
         path = self.shards[self.shard_idx]
         self.tokens = np.memmap(path, dtype=self.dtype, mode="r")
         n_disk = len(self.tokens)
@@ -50,6 +50,7 @@ class DataLoader:
         # 返回 x, y
         B, T = self.B, self.T
         if self.pos + B*T+1 > len(self.tokens):
+            # 如果这个 shard 的剩余部分不够 B*T 了，就切换到下一片
             self.shard_idx = (self.shard_idx + 1) % len(self.shards)
             self.pos = 0
             self._load_shard()
@@ -65,6 +66,17 @@ class DataLoader:
         self.pos += B*T
 
         return x, y  # 已经做了格式转换、搬到 device 上
+    
+    def state_dict(self):
+        return {
+            "shard_idx": self.shard_idx,
+            "pos": self.pos,
+        }
+
+    def load_state_dict(self, state):
+        self.shard_idx = state["shard_idx"]
+        self._load_shard()
+        self.pos = state["pos"]
 
 
 if __name__ == "__main__":

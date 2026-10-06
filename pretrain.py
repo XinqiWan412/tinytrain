@@ -49,7 +49,8 @@ def train(model: model.ModelForCausalLM,
         optimizer: torch.optim.Optimizer, 
         loader: dataloader.DataLoader, 
         val_loader: dataloader.DataLoader,
-        train_config: TrainConfig):
+        train_config: TrainConfig,
+        start_step=0):
     model.train()
     B, T = loader.B, loader.T
     use_cuda = torch.cuda.is_available()
@@ -58,7 +59,7 @@ def train(model: model.ModelForCausalLM,
     eval_interval = train_config.eval_interval
     assert global_batch_size % (B*T) == 0
     grad_accum_steps = global_batch_size // (B*T)
-    for step in range(steps):
+    for step in range(start_step, steps):
         # 每 eval_interval 个 step 就做一次 eval
         if step % eval_interval == 0:
             val_loss = evaluate(model, val_loader, train_config)
@@ -158,13 +159,14 @@ def save_checkpoint(path,
         # 接着训需要的
         "optimizer": optimizer.state_dict(),
         "step": step,  # 从这一步继续训
-        "loader_shard_idx": loader.shard_idx,
-        "loader_pos": loader.pos,
+        "loader": loader.state_dict(),
         # 留作记录的
         "train_config": asdict(train_config),
         "val_loss": val_loss,
     }
-    torch.save(checkpoint, path)
+    tmp_path = path + ".tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, path)
 
 
 def log(text):
@@ -177,6 +179,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", default="logs/pretrain.log")
     parser.add_argument("--max_steps", type=int, default=None)
+    parser.add_argument("--eval_interval", type=int, default=None)
+    parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
 
     # 写 log 的准备
@@ -187,6 +191,8 @@ if __name__ == "__main__":
     train_config = TrainConfig()
     if args.max_steps is not None:
         train_config.max_steps = args.max_steps
+    if args.eval_interval is not None:
+        train_config.eval_interval = args.eval_interval
     torch.manual_seed(train_config.seed)
     np.random.seed(train_config.seed)
     data_dir = train_config.data_dir
@@ -209,7 +215,19 @@ if __name__ == "__main__":
         B, T = train_config.B, train_config.T
         loader = dataloader.DataLoader(data_dir, 'train', B, T, device)
         val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device)
-        train(m, optimizer, loader, val_loader, train_config)
+        if args.resume:
+            # 断点续训，读取训练中断前的模型、优化器、train loader 的 state_dict
+            ckpt = torch.load("checkpoints/latest.pt", map_location=device)
+            m.load_state_dict(ckpt["model"])
+            optimizer.load_state_dict(ckpt["optimizer"])
+            loader.load_state_dict(ckpt["loader"])
+            start_step = ckpt["step"]
+            del ckpt  # 注意要释放 ckpt，能省很多显存
+            log(f"resume from step {start_step}")
+            train(m, optimizer, loader, val_loader, train_config, start_step)
+        else:
+            # 从头开始的训练走这里            
+            train(m, optimizer, loader, val_loader, train_config)
     elif MODE == "lr":
         for s in [0, 29, 30, 165, 299, 300]:
             log(f"s {s}, lr {get_lr(s, train_config):.6e}")
