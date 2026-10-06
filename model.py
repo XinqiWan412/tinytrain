@@ -8,12 +8,12 @@ import torch.nn.functional as F
 @dataclass
 class ModelConfig:
     vocab_size: int = 32768
-    hidden_size: int = 256
-    num_hidden_layers: int = 4  # layers
-    num_attention_heads: int = 4  # num_head
+    hidden_size: int = 768
+    num_hidden_layers: int = 12  # layers
+    num_attention_heads: int = 8  # num_head
     num_key_value_heads: int = 2  # num_kv_head
-    head_dim: int = 64
-    intermediate_size: int = 768
+    head_dim: int = 128
+    intermediate_size: int = 3 * 768
     max_seq_len: int = 512
     rope_theta: float = 1e6
     rms_norm_eps: float = 1e-6

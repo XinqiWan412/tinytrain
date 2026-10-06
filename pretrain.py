@@ -19,8 +19,8 @@ class TrainConfig:
     global_batch_size: int = 65536
     max_lr: float = 1e-3
     min_lr: float = 1e-4
-    warmup_steps: int = 150
-    max_steps: int = 3000
+    warmup_steps: int = 1000
+    max_steps: int = 34000
     weight_decay: float = 0.1
     betas: tuple = (0.9, 0.95)
     grad_clip: float = 1.0
