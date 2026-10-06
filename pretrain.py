@@ -3,6 +3,7 @@ import numpy as np
 import model, dataloader
 import time, math, os
 from dataclasses import dataclass, asdict
+import argparse
 
 # MODE = "overfit"
 MODE = "train"
@@ -41,7 +42,7 @@ def overfit_single_batch(model, optimizer, loader: dataloader.DataLoader, train_
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
         optimizer.step()
         if step % 20 == 0 or step == steps - 1:  # 每 20 步打印一次
-            print(step, loss.item())
+            log(f"step {step} loss {loss.item()}")
 
 
 def train(model: model.ModelForCausalLM, 
@@ -61,7 +62,7 @@ def train(model: model.ModelForCausalLM,
         # 每 eval_interval 个 step 就做一次 eval
         if step % eval_interval == 0:
             val_loss = evaluate(model, val_loader, train_config)
-            print(f'step:{step}, val_loss:{val_loss:.4f}')
+            log(f'step:{step}, val_loss:{val_loss:.4f}')
             save_checkpoint("checkpoints/latest.pt", model, optimizer, loader, train_config, step, val_loss)
         t0 = time.perf_counter()
         optimizer.zero_grad()
@@ -83,11 +84,11 @@ def train(model: model.ModelForCausalLM,
         t1 = time.perf_counter()
         dt = t1 - t0
         if step % log_interval == 0 or step == steps - 1:
-            print(f"step:{step}, loss:{loss_accum.item():.4f}, dt:{dt*1000:.1f}ms, tok/s:{B*T/dt*grad_accum_steps:.0f}, norm:{norm.item():.4f}, lr:{lr:.4e}")
+            log(f"step:{step}, loss:{loss_accum.item():.4f}, dt:{dt*1000:.1f}ms, tok/s:{B*T/dt*grad_accum_steps:.0f}, norm:{norm.item():.4f}, lr:{lr:.4e}")
 
     # 最后做一次 eval
     val_loss = evaluate(model, val_loader, train_config)
-    print(f'step:{steps}, val_loss:{val_loss:.4f}')
+    log(f'step:{steps}, val_loss:{val_loss:.4f}')
     save_checkpoint("checkpoints/final.pt", model, optimizer, loader, train_config, steps, val_loss)
 
 
@@ -102,7 +103,7 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
     
     wd_numel = sum(p.numel() for p in wd)
     keep_numel = sum(p.numel() for p in keep)
-    print(f"weight_decay: {len(wd)} tensors, {wd_numel} params | no_decay: {len(keep)} tensors, {keep_numel} params")
+    log(f"weight_decay: {len(wd)} tensors, {wd_numel} params | no_decay: {len(keep)} tensors, {keep_numel} params")
     params = [
         {"params": wd, "weight_decay": weight_decay},
         {"params": keep, "weight_decay": 0.0},
@@ -166,9 +167,26 @@ def save_checkpoint(path,
     torch.save(checkpoint, path)
 
 
+def log(text):
+    print(text)
+    log_file.write(text + "\n")
+    log_file.flush()
+
+
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--log", default="logs/pretrain.log")
+    parser.add_argument("--max_steps", type=int, default=None)
+    args = parser.parse_args()
+
+    # 写 log 的准备
+    os.makedirs(os.path.dirname(args.log), exist_ok=True)
+    log_file = open(args.log, "a")
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_config = TrainConfig()
+    if args.max_steps is not None:
+        train_config.max_steps = args.max_steps
     torch.manual_seed(train_config.seed)
     np.random.seed(train_config.seed)
     data_dir = train_config.data_dir
@@ -194,7 +212,7 @@ if __name__ == "__main__":
         train(m, optimizer, loader, val_loader, train_config)
     elif MODE == "lr":
         for s in [0, 29, 30, 165, 299, 300]:
-            print(s, f"{get_lr(s, train_config):.6e}")
+            log(f"s {s}, lr {get_lr(s, train_config):.6e}")
     elif MODE == "load":
         path = "checkpoints/final.pt"
         B, T = train_config.B, train_config.T
@@ -204,4 +222,4 @@ if __name__ == "__main__":
 
         ckpt = torch.load(path, map_location=device)
         ckpt_loss = ckpt["val_loss"]
-        print(f"loss={loss:.6f}, ckpt_loss={ckpt_loss:.6f}")
+        log(f"loss={loss:.6f}, ckpt_loss={ckpt_loss:.6f}")
