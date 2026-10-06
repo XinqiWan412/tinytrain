@@ -7,7 +7,7 @@ import torch.nn.functional as F
 
 @dataclass
 class ModelConfig:
-    vocab_size: int = 50304
+    vocab_size: int = 32768
     hidden_size: int = 256
     num_hidden_layers: int = 4  # layers
     num_attention_heads: int = 4  # num_head

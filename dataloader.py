@@ -68,32 +68,10 @@ class DataLoader:
 
 
 if __name__ == "__main__":
-    data_dir = "./data/tokenized/gpt2"
+    data_dir = "./data/tokenized/bpe32k"
     B = 4
     T = 512
     device = "cpu"
-    # dataloader = DataLoader(data_dir, 'train', B, T, device)
-    # x, y = dataloader.next_batch()
-    # # 测试dataloader读取batch是否正确
-    # print(x.shape, y.shape)  # 检查shape
-    # print(x.dtype, y.dtype)  # 检查dtype
-    # print(torch.equal(x[0, 1:], y[0, :-1]))  # 检查x,y是否成功错开1格
-
-    # enc = tiktoken.get_encoding('gpt2')
-    # print(enc.decode(x[0].tolist()[:100]))  # 检查内容是否正常
-
-
-    # # val也检查一遍
-    # dataloader = DataLoader(data_dir, 'val', B, T, device)
-    # x, y = dataloader.next_batch()
-    # # 测试dataloader读取batch是否正确
-    # print(x.shape, y.shape)  # 检查shape
-    # print(x.dtype, y.dtype)  # 检查dtype
-    # print(torch.equal(x[0, 1:], y[0, :-1]))  # 检查x,y是否成功错开1格
-
-    # enc = tiktoken.get_encoding('gpt2')
-    # print(enc.decode(x[0].tolist()[:100]))  # 检查内容是否正常
-
 
     # 测试换页逻辑
     dataloader = DataLoader(data_dir, 'train', B, T, device)

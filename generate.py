@@ -1,7 +1,7 @@
 import torch
 from model import ModelForCausalLM, load_model, ModelConfig
 import torch.nn.functional as F
-import tiktoken
+from tokenizer import enc
 
 
 def generate(model: ModelForCausalLM, idx, max_new_tokens, temperature, top_k):
@@ -38,22 +38,21 @@ if __name__ == "__main__":
     model.eval()
 
     # 编码
-    enc = tiktoken.get_encoding("gpt2")
     text = "The water cycle is"
     ids = [enc.eot_token] + enc.encode_ordinary(text)
     ids = torch.tensor(ids, dtype=torch.long, device=device).unsqueeze(0)  # (1, T)
     ids = ids.repeat(5, 1)  # dim=0 复制 5 份，dim=1 复制 1 份
 
     # 调用推理
-    temperature, top_k, max_new_tokens = 0.0, 50, 100
+    temperature, top_k, max_new_tokens = 1.0, 50, 100
     ids = generate(model, ids, max_new_tokens, temperature, top_k)
 
     # 解码
     ids = ids.tolist()
     for row in ids:
         row = row[1:]  # 去掉开头的 EOT
-        if 50256 in row:
-            idx = row.index(50256)
+        if enc.eot_token in row:
+            idx = row.index(enc.eot_token)
             row = row[:idx]
         print(enc.decode(row))
         print("-" * 40)

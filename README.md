@@ -1,7 +1,7 @@
 # tinytrain
 
 从零手写的 LLM 训练全流程：预训练 → SFT → GRPO。模型结构参考 Qwen3-0.6B，
-在单张 RTX 4070 Ti Super（16GB）上用 1600 万参数的小模型跑通。
+在单张 RTX 4070 Ti Super（16GB）上用 1150 万参数的小模型跑通。
 模型、数据加载、训练循环、对话模板、GRPO 都是自己实现的，没有用 transformers / trl。
 
 ## 结果
@@ -19,7 +19,7 @@ GRPO：不加 KL 时测试准确率持续下滑（33.4% → 25.8%）；加 KL（
 采样奖励从 0.165 涨到 0.187，但贪心准确率的提升在统计误差（约 ±2 个百分点）以内。
 
 ## 实现要点
-- 模型结构：参考 Qwen3-0.6B，pre-norm、QK-norm、SwiGLU、GQA 等。16M 配置为 hidden 256、4 层、4 头 / 2 KV 头、FFN 768，词表 50304（GPT-2 词表 + 对话特殊 token），embedding 与 lm_head 共享权重
+- 模型结构：参考 Qwen3-0.6B，pre-norm、QK-norm、SwiGLU、GQA 等。配置为 hidden 256、4 层、4 头 / 2 KV 头、FFN 768，词表 32768（自训 BPE，含 5 个对话特殊 token），embedding 与 lm_head 共享权重
 - 训练配置：AdamW（betas 0.9/0.95，weight decay 0.1 只加在 2 维参数上），warmup + 余弦衰减，梯度裁剪 1.0，梯度累积，bf16 autocast
 - SFT：只对答案和 `<|im_end|>` 算 loss
 - GRPO：媒体采样 8 次，组内标准化算优势，loss 加对冻结参考模型的 KL 乘法（k3 估计）
@@ -59,14 +59,18 @@ huggingface-cli download HuggingFaceFW/fineweb-edu --repo-type dataset \
 ```
 
 **2. 分词并切片**：`python prepare_data.py`
+
+分词器来自 tokenizer_32k.json，由 train_tokenizer.py 训练得到，想重训可以运行 `python train_tokenizer.py --train`。
+
 - 输入：`data/raw/fineweb-edu/sample/10BT/000_00000.parquet`
-- 输出：`data/tokenized/gpt2/` 下的 `val_000000.bin`（约 1000 万 token）、`train_000000~000007.bin`（每片约 1 亿 token）、`meta.json`
+- 输出：`data/tokenized/bpe32k/` 下的 `val_000000.bin`（约 1000 万 token）、`train_000000~000007.bin`（每片约 1 亿 token）、`meta.json`
 
 **3. 预训练**：`python pretrain.py`
 - 输入：上一步的 .bin 分片
 - 输出：`checkpoints/final.pt`
-- 3000 步，每步 65,536 token（B=16、T=512、累积 8 次），约 281ms/步，共约 15 分钟
-- 预期：val loss 约 4.28
+- 3000 步，每步 65,536 token（B=16、T=512、累积 8 次），约 206ms/步，共约 10 分钟
+- 预期：val loss 约 4.22
+- 对比 v0.1：从 23.3 万 tok/s 提升到 31.7 万 tok/s，快了约 36%，每步从 280ms 降到 206ms，val loss 从 4.2807 降到 4.2195。两个分词器切出的 token 大小不同，loss 不能直接比；换算成每字节损失（loss / 每 token 字节数），v0.1 是 0.922，新版是 0.927，效果持平
 
 **4. SFT**：`python sft.py`
 - 输入：`checkpoints/final.pt`；题目由 sft_data.py 按 SEED=400 生成，不需要额外数据

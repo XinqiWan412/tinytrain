@@ -12,7 +12,7 @@ MODE = "train"
 
 @dataclass
 class TrainConfig:
-    data_dir: str = "./data/tokenized/gpt2"
+    data_dir: str = "./data/tokenized/bpe32k"
     B: int = 16
     T: int = 512
     global_batch_size: int = 65536
