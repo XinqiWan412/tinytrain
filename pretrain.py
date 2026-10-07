@@ -4,6 +4,7 @@ import model, dataloader
 import time, math, os
 from dataclasses import dataclass, asdict
 import argparse
+from logger import log, setup_log
 
 # MODE = "overfit"
 MODE = "train"
@@ -169,12 +170,6 @@ def save_checkpoint(path,
     os.replace(tmp_path, path)
 
 
-def log(text):
-    print(text)
-    log_file.write(text + "\n")
-    log_file.flush()
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", default="logs/pretrain.log")
@@ -184,8 +179,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # 写 log 的准备
-    os.makedirs(os.path.dirname(args.log), exist_ok=True)
-    log_file = open(args.log, "a")
+    setup_log(args.log)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_config = TrainConfig()

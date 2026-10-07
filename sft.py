@@ -7,6 +7,7 @@ import argparse
 from sft_data import build_example, split_pairs, SEED, N_TEST
 from model import load_model
 from pretrain import TrainConfig, configure_optimizer, get_lr
+from logger import log, setup_log
 
 
 def collate(examples, device):
@@ -77,15 +78,18 @@ def evaluate(model, test, B, device):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--max_steps", type=int, default=2000)
-    parser.add_argument("--out", default="checkpoints/sft.pt")
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--init", required=True)
+    parser.add_argument("--log", default="logs/sft.log")
     args = parser.parse_args()
+    setup_log(args.log)
+    log(f"args: {args}")
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    path = "checkpoints/final.pt"
-    m = load_model(path, device)  # 加载模型
+    m = load_model(args.init, device)  # 加载模型
     m.train()
-    print(m.config.vocab_size)
+    log(f"vocab_size: {m.config.vocab_size}")
     # 配置 sft 训练参数
     train_config = TrainConfig(
         max_lr=3e-4,
@@ -111,11 +115,11 @@ if __name__ == "__main__":
         for g in optimizer.param_groups:
             g['lr'] = lr
         optimizer.step()
-        if step % 10 == 0 or step == train_config.max_steps - 1:  # 定期打印log
-            print(f"step:{step}, loss:{loss.item():.4f}, lr:{lr:.4e}")
-        if step % train_config.eval_interval == 0 or step == train_config.max_steps - 1:  # 定期做eval
+        if step % 10 == 0 or step == train_config.max_steps - 1:  # 定期打印 log
+            log(f"step:{step}, loss:{loss.item():.4f}, lr:{lr:.4e}")
+        if step % train_config.eval_interval == 0 or step == train_config.max_steps - 1:  # 定期打印 val_loss
             val_loss = evaluate(m, test, B, device)
-            print(f"step={step}, val_loss={val_loss:.4f}")
+            log(f"step={step}, val_loss={val_loss:.4f}")
     
     # 保存
     save_path = args.out
@@ -124,12 +128,3 @@ if __name__ == "__main__":
         "model_config": asdict(m.config),
     }
     torch.save(checkpoint, save_path)
-
-    # # 测试模型保存是否成功
-    # path = "checkpoints/sft.pt"
-    # m = load_model(path, device)
-    # n_test, B = 500, 128
-    # train, test = split_pairs(400, n_test)  # 取 pairs
-    # sftloader = SFTLoader(train, B, device, 400)
-    # val_loss = evaluate(m, test, B, device)
-    # print(f"val_loss={val_loss:.4f}")

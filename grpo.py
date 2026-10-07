@@ -10,6 +10,8 @@ from sft import collate
 from pretrain import TrainConfig, configure_optimizer, get_lr
 from eval_sft import evaluate_accuracy
 from collections import defaultdict
+import argparse
+from logger import log, setup_log
 
 
 def rollout(model: ModelForCausalLM, pairs, G, device):
@@ -120,12 +122,20 @@ def compute_loss(model: ModelForCausalLM, prompts, responses, advantages, G, dev
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--max_steps", type=int, default=500)
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--init", required=True)
+    parser.add_argument("--log", default="logs/grpo.log")
+    args = parser.parse_args()
+    setup_log(args.log)
+    log(f"args: {args}")
+
     train, test = split_pairs(SEED, N_TEST)
 
     # 创建模型
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    path = "checkpoints/sft_weak.pt"
-    model = load_model(path, device)
+    model = load_model(args.init, device)
     model.eval()
     G = 8  # 重复推理 G 次
     B = 64  # batch
@@ -134,7 +144,7 @@ if __name__ == "__main__":
     beta = 0.2
     ref_model = None
     if beta > 0:
-        ref_model = load_model(path, device)
+        ref_model = load_model(args.init, device)
         ref_model.eval()
         ref_model.requires_grad_(False)
 
@@ -143,14 +153,14 @@ if __name__ == "__main__":
         max_lr=2e-5,
         min_lr=2e-6,
         warmup_steps=20,
-        max_steps=500,
+        max_steps=args.max_steps,
         eval_interval=50,
     )
     optimizer = configure_optimizer(model, train_config)
     rng = random.Random(SEED)
     model.eval()
     accuracy_rate = evaluate_accuracy(model, test, 100, device, show_wrong=False)
-    print(f"step:0, accuracy_rate:{accuracy_rate:.4f}")
+    log(f"step:0, accuracy_rate:{accuracy_rate:.4f}")
 
     # 训练循环
     for step in range(train_config.max_steps):
@@ -173,15 +183,15 @@ if __name__ == "__main__":
         n_correct = rewards.sum(dim=-1)  # (B,) 每道题在 G 次采样里答对的次数
         mixed = (n_correct > 0) & (n_correct < G)  # (B,) 是否有对有错的 mask
         mixed_ratio = mixed.to(torch.float32).mean()
-        print(f"step:{step+1}, rewards_avg:{rewards.mean():.4f}, mixed_ratio:{mixed_ratio.item():.4f}, loss:{loss.item():.4f}, kl:{kl.item():.2e}")
+        log(f"step:{step+1}, rewards_avg:{rewards.mean():.4f}, mixed_ratio:{mixed_ratio.item():.4f}, loss:{loss.item():.4f}, kl:{kl.item():.2e}")
         # 定期用测试集评估
         if (step + 1) % train_config.eval_interval == 0:
             model.eval()
             accuracy_rate = evaluate_accuracy(model, test, 100, device, show_wrong=False)
-            print(f"step:{step+1}, accuracy_rate:{accuracy_rate:.4f}")
+            log(f"step:{step+1}, accuracy_rate:{accuracy_rate:.4f}")
 
     # 保存模型
-    save_path = "checkpoints/grpo_kl02.pt"
+    save_path = args.out
     checkpoint = {
         "model": model.state_dict(),
         "model_config": asdict(model.config),
