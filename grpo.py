@@ -7,7 +7,7 @@ from model import ModelForCausalLM, load_model
 from sft_data import build_xy, split_pairs, SEED, N_TEST, make_question, parse_answer
 from tokenizer import render_prompt, IM_END
 from sft import collate
-from pretrain import TrainConfig, configure_optimizer, get_lr
+from pretrain import TrainConfig, configure_optimizer, get_lr, zero_grad_all, set_lr, step_all
 from eval_sft import evaluate_accuracy
 from collections import defaultdict
 import argparse
@@ -138,6 +138,7 @@ if __name__ == "__main__":
     parser.add_argument("--init", required=True)
     parser.add_argument("--log", default="logs/grpo.log")
     parser.add_argument("--chunk_size", type=int, default=128)
+    parser.add_argument("--optimizer", default="adamw", choices=["adamw", "muon"])
     args = parser.parse_args()
     setup_log(args.log)
     log(f"args: {args}")
@@ -167,7 +168,7 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         eval_interval=50,
     )
-    optimizer = configure_optimizer(model, train_config)
+    optimizers = configure_optimizer(model, train_config, args.optimizer)
     rng = random.Random(SEED)
     model.eval()
     accuracy_rate = evaluate_accuracy(model, test, 100, device, show_wrong=False)
@@ -179,14 +180,13 @@ if __name__ == "__main__":
         model.eval()
         prompts, responses, rewards, advantages = rollout(model, pairs, G, device)  # rollout 得到 G 组结果
         model.train()
-        optimizer.zero_grad()
+        zero_grad_all(optimizers)
         loss, kl = compute_loss(model, prompts, responses, advantages, G, device, ref_model, beta, args.chunk_size)  # GRPO 计算 loss
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)  # 梯度裁剪
         
         lr = get_lr(step, train_config)  # 每一步动态设置 lr
-        for g in optimizer.param_groups:
-            g['lr'] = lr
-        optimizer.step()
+        set_lr(optimizers, lr)
+        step_all(optimizers)
 
         # 打印 step、平均奖励、有对有错的比例、loss
         rewards = rewards.view(B, G)

@@ -6,7 +6,7 @@ import argparse
 
 from sft_data import build_example, split_pairs, SEED, N_TEST
 from model import load_model
-from pretrain import TrainConfig, configure_optimizer, get_lr
+from pretrain import TrainConfig, configure_optimizer, get_lr, zero_grad_all, set_lr, step_all
 from logger import log, setup_log
 
 
@@ -81,6 +81,7 @@ if __name__ == "__main__":
     parser.add_argument("--out", required=True)
     parser.add_argument("--init", required=True)
     parser.add_argument("--log", default="logs/sft.log")
+    parser.add_argument("--optimizer", default="adamw", choices=["adamw", "muon"])
     args = parser.parse_args()
     setup_log(args.log)
     log(f"args: {args}")
@@ -98,23 +99,22 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         eval_interval=100,
     )
-    optimizer = configure_optimizer(m, train_config)  # 加载优化器
+    optimizers = configure_optimizer(m, train_config, args.optimizer)  # 加载优化器
     B = 128
     train, test = split_pairs(SEED, N_TEST)  # 取 pairs
     sftloader = SFTLoader(train, B, device, SEED)
 
     # 训练
     for step in range(train_config.max_steps):
-        optimizer.zero_grad()
+        zero_grad_all(optimizers)
         x, y = sftloader.next_batch()
         with torch.autocast(device_type=device, dtype=torch.bfloat16):
             _, loss = m(x, y)
         loss.backward()
         norm = torch.nn.utils.clip_grad_norm_(m.parameters(), train_config.grad_clip)
         lr = get_lr(step, train_config)  # 每步的学习率都在变
-        for g in optimizer.param_groups:
-            g['lr'] = lr
-        optimizer.step()
+        set_lr(optimizers, lr)
+        step_all(optimizers)
         if step % 10 == 0 or step == train_config.max_steps - 1:  # 定期打印 log
             log(f"step:{step}, loss:{loss.item():.4f}, lr:{lr:.4e}")
         if step % train_config.eval_interval == 0 or step == train_config.max_steps - 1:  # 定期打印 val_loss
