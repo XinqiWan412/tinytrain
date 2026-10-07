@@ -86,7 +86,7 @@ def token_logprobs(model, xs, ys):
     return -nll  # 取负号是因为函数要返回 "logprobs"
 
 
-def compute_loss(model: ModelForCausalLM, prompts, responses, advantages, G, device, ref_model: ModelForCausalLM, beta):
+def compute_loss(model: ModelForCausalLM, prompts, responses, advantages, G, device, ref_model: ModelForCausalLM, beta, chunk_size):
     # 用 rollout 的结果，计算 loss
     examples = []
     for i, resp in enumerate(responses):
@@ -94,31 +94,41 @@ def compute_loss(model: ModelForCausalLM, prompts, responses, advantages, G, dev
         x, y = build_xy(prompt, resp)
         examples.append((x, y))
     xs, ys = collate(examples, device)  # (B*G, L)
+    N = xs.shape[0]  # 总行数
 
-    if beta > 0:
-        # 启动 KL 散度
-        with torch.no_grad():
-            ref_logp = token_logprobs(ref_model, xs, ys)
-    else:
-        # 不启动 KL 散度
-        ref_logp = None
+    loss_sum, kl_sum = 0.0, 0.0
+    for i in range(0, N, chunk_size):
+        xs_c = xs[i:i+chunk_size]
+        ys_c = ys[i:i+chunk_size]
+        adv_c = advantages[i:i+chunk_size]
 
-    # 计算 GRPO 的 loss
-    logp = token_logprobs(model, xs, ys)
-    mask = (ys != -100).to(torch.float32)  # (B*G, L)
-    nll = (-logp * mask).sum(dim=-1) / mask.sum(dim=-1)  # (B*G,)，行内求平均，得到这一行的 loss
-    loss = (advantages * nll).mean()  # 每行乘以优势，再跨行求平均
+        if beta > 0:
+            # 启动 KL 散度
+            with torch.no_grad():
+                ref_logp = token_logprobs(ref_model, xs_c, ys_c)
+        else:
+            # 不启动 KL 散度
+            ref_logp = None
 
-    if ref_logp is not None:
-        d = ref_logp - logp  # (B*G, L)
-        kl_tok = torch.exp(d) - d - 1  # (B*G, L)
-        kl = (kl_tok * mask).sum(dim=-1) / mask.sum(dim=-1)  # 先行内求平均
-        kl = kl.mean()  # 再跨行求平均
-        loss = loss + beta * kl  # loss 加上 kl
-    else:
-        kl = torch.zeros((), device=device)  # 占位，保证 kl.item() 的打印
+        # 计算 GRPO 的 loss
+        logp = token_logprobs(model, xs_c, ys_c)
+        mask = (ys_c != -100).to(torch.float32)  # (C, L)
+        nll = (-logp * mask).sum(dim=-1) / mask.sum(dim=-1)  # (C,)，行内求平均，得到这一行的 loss
+        loss = (adv_c * nll).sum() / N  # 每行乘以优势，再跨行求平均
 
-    return loss, kl
+        if ref_logp is not None:
+            # ref_logp 非空，启动 kl 散度
+            d = ref_logp - logp  # (C, L)
+            kl_tok = torch.exp(d) - d - 1  # (C, L)
+            kl = (kl_tok * mask).sum(dim=-1) / mask.sum(dim=-1)  # 先行内求平均
+            kl = kl.sum() / N  # 再跨行求平均
+            loss = loss + beta * kl  # loss 加上 kl
+            kl_sum += kl.item()
+        
+        loss.backward()
+        loss_sum += loss.item()
+
+    return loss_sum, kl_sum
 
 
 if __name__ == "__main__":
@@ -127,6 +137,7 @@ if __name__ == "__main__":
     parser.add_argument("--out", required=True)
     parser.add_argument("--init", required=True)
     parser.add_argument("--log", default="logs/grpo.log")
+    parser.add_argument("--chunk_size", type=int, default=128)
     args = parser.parse_args()
     setup_log(args.log)
     log(f"args: {args}")
@@ -169,8 +180,7 @@ if __name__ == "__main__":
         prompts, responses, rewards, advantages = rollout(model, pairs, G, device)  # rollout 得到 G 组结果
         model.train()
         optimizer.zero_grad()
-        loss, kl = compute_loss(model, prompts, responses, advantages, G, device, ref_model, beta)  # GRPO 计算 loss
-        loss.backward()
+        loss, kl = compute_loss(model, prompts, responses, advantages, G, device, ref_model, beta, args.chunk_size)  # GRPO 计算 loss
         norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)  # 梯度裁剪
         
         lr = get_lr(step, train_config)  # 每一步动态设置 lr
@@ -183,7 +193,7 @@ if __name__ == "__main__":
         n_correct = rewards.sum(dim=-1)  # (B,) 每道题在 G 次采样里答对的次数
         mixed = (n_correct > 0) & (n_correct < G)  # (B,) 是否有对有错的 mask
         mixed_ratio = mixed.to(torch.float32).mean()
-        log(f"step:{step+1}, rewards_avg:{rewards.mean():.4f}, mixed_ratio:{mixed_ratio.item():.4f}, loss:{loss.item():.4f}, kl:{kl.item():.2e}")
+        log(f"step:{step+1}, rewards_avg:{rewards.mean():.4f}, mixed_ratio:{mixed_ratio.item():.4f}, loss:{loss:.4f}, kl:{kl:.2e}")
         # 定期用测试集评估
         if (step + 1) % train_config.eval_interval == 0:
             model.eval()
