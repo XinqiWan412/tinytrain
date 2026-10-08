@@ -2,7 +2,7 @@ import torch
 import random
 from tokenizer import enc
 from dataclasses import asdict
-import argparse
+import argparse, os
 
 from sft_data import build_example, split_pairs, SEED, N_TEST
 from model import load_model
@@ -127,4 +127,6 @@ if __name__ == "__main__":
         "model": m.state_dict(),
         "model_config": asdict(m.config),
     }
-    torch.save(checkpoint, save_path)
+    tmp_path = save_path + ".tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, save_path)

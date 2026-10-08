@@ -1,4 +1,4 @@
-import random
+import random, os
 from dataclasses import asdict
 import torch
 import torch.nn.functional as F
@@ -206,4 +206,6 @@ if __name__ == "__main__":
         "model": model.state_dict(),
         "model_config": asdict(model.config),
     }
-    torch.save(checkpoint, save_path)
+    tmp_path = save_path + ".tmp"
+    torch.save(checkpoint, tmp_path)
+    os.replace(tmp_path, save_path)
