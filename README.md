@@ -6,18 +6,24 @@
 
 ## 结果
 
-### 1.12 亿参数全流程（AdamW）
+### 1.12 亿参数全流程：AdamW vs Muon
 
-参数量 112,482,048。SFT 和 GRPO 的超参数与 v0.2 相同。
+参数量 112,482,048。两条路线的数据、步数、lr 和调度完全相同，唯一的区别是优化器（`--optimizer`）。Muon 路线的 SFT 和 GRPO 也用 Muon。
 
-| 阶段 | 设置 | 结果 |
-|---|---|---|
-| 预训练 | fineweb-edu 约 22.3 亿 token（约 20 倍参数量），34,000 步 | val loss 约 3.15（每字节损失 0.692），约 4.9 万 tok/s，显存峰值约 11.7 GB，共约 13 小时 |
-| SFT | 0~99 两数相加，9,500 题训练、500 题测试，2000 步 | 测试集贪心准确率 100% |
-| SFT（弱起点） | 同上，57 步 | 40.0%，作为 GRPO 的起点 |
-| GRPO | 每步 64 题 × 8 次采样，lr 2e-5，500 步，β=0.2 | 结尾 94.2%，10 次评估平均 82.2% |
+| 阶段 | 指标 | AdamW | Muon |
+|---|---|---|---|
+| 预训练 | val loss（第 34000 步） | 3.1466 | 3.1069 |
+| | 每字节损失 | 0.692 | 0.683 |
+| | 速度 | 约 4.90 万 tok/s | 约 4.76 万 tok/s |
+| | 显存 | 约 11.7 GB | 约 10.6 GB |
+| | 总时长（按每步时间估算） | 约 12.6 小时 | 约 13.0 小时 |
+| SFT | 2000 步，测试集贪心准确率 | 100% | 100% |
+| 弱起点 | 步数，准确率 | 57 步，40.0% | 75 步，40.8% |
+| GRPO | 结尾（相对起点） | 94.2%（+54.2） | 84.6%（+43.8） |
+| | 10 次评估平均（相对起点） | 82.2%（+42.2） | 71.5%（+30.7） |
 
-和下面 1150 万参数模型用的是同一份 val 数据和同一套题目，可以直接比较：预训练每字节损失 0.692 vs 0.927；GRPO 相对起点的提升，结尾 +54.2 vs +32.0，10 次评估平均 +42.2 vs +22.1
+- 预训练：Muon 最终 val loss 低 0.040；第 28250 步（3.1443）就达到了 AdamW 的最终值，少用约 17% 的步数，扣掉每步慢约 3%，按时间算约省 14%。这个 17% 是偏保守的估计：两条线的 lr 调度都按 34000 步排，Muon 在第 28250 步时 lr 还没退火完，如果按 28250 步排调度，可能更早追上
+- SFT 和 GRPO：Muon 在短程训练的前期都比 AdamW 慢（弱起点要 75 步才到 40%，AdamW 57 步；GRPO 提升少约 10 个点，500 步结尾仍在上涨）。可能的原因：Muon 的更新幅度按 AdamW 稳定后的步长对齐，而 AdamW 在训练开头的实际步长更大，同样的 lr 下 Muon 在短程微调里更保守。这一点没有做实验验证；GRPO 只跑了一次，波动也不小，关于优化器的结论以预训练对比为准
 
 ### 1150 万参数全流程（v0.2）
 
@@ -38,7 +44,7 @@
 
 ## 实现要点
 - 模型结构：配置为 hidden 768、12 层、8 头 / 2 KV 头（head_dim 128）、FFN 2304，共 1.12 亿参数（v0.2 为 hidden 256、4 层、FFN 768，1150 万参数）
-- 训练配置：AdamW（betas 0.9/0.95，weight decay 0.1 只加在 2 维参数上），warmup + 余弦衰减，梯度裁剪 1.0，梯度累积，bf16 autocast
+- 训练配置：AdamW（betas 0.9/0.95，weight decay 0.1 只加在 2 维参数上）或 Muon + AdamW（--optimizer muon），warmup + 余弦衰减，梯度裁剪 1.0，梯度累积，bf16 autocast
 - SFT：只对答案和 `<|im_end|>` 算 loss
 - GRPO：每题采样 8 次，组内标准化算优势，loss 加对冻结参考模型的 KL 惩罚（k3 估计）
 - GRPO 分块梯度累积：1.12 亿参数时，每步 512 条序列一次前向放不下。compute_loss 把它们分块（`--chunk_size`，默认 128），每块单独做参考模型前向、策略模型前向和 backward，梯度在 .grad 里累加；每块的 loss 和 KL 对块内各行求和后除以总行数，各块梯度之和与不分块时一致（v0.2 小模型上 1 块和 4 块的梯度范数 2.219704 vs 2.219820）
@@ -49,6 +55,7 @@
 ```
 - 长时间训练：日志（logger.py，pretrain/sft/grpo 共用）在 print 的同时追加写进文件、每行 flush；断点续训保存模型、优化器、步数和 DataLoader 位置（DataLoader 提供 state_dict / load_state_dict），checkpoint 先写临时文件再用 os.replace 替换，写到一半被打断也不会损坏旧文件
 - 数据切分：一次处理目录下所有 parquet，分片编号跨文件连续；val 固定为第一个文件开头的 1000 万 token，增加数据后结果仍能和之前比较
+- Muon（muon.py）：动量（0.95，Nesterov）之后用 Newton-Schulz 迭代 5 次把动量矩阵近似正交化（只用矩阵乘，bf16），让各奇异方向的步长一致；更新系数用 Moonlight 的 0.2×√max(行, 列)，使更新幅度与 AdamW 对齐，lr、weight decay 和调度都直接沿用 AdamW；按参数形状分组：块内的 2 维矩阵（q/k/v/o 和 MLP 三个矩阵）用 Muon，embedding（与 lm_head 共享）和 1 维 norm 参数仍用 AdamW；configure_optimizer 返回优化器列表，训练循环通过 zero_grad_all / set_lr / step_all 统一操作
 
 ## 项目结构
 - `prepare_data.py`：把目录下所有 .parquet 切成 .bin 分片，内含 check_all 校验
@@ -57,14 +64,15 @@
 - `tokenizer.py`：加载了特殊 token 的分词器 enc，以及两个输入 str、返回 token_ids(list[int])的 render 函数
 - `model.py`：实现模型结构，内含 load_model 函数、ModelConfig
 - `test_model.py`：用于测试 model.py 的模型各模块是否正确
-- `pretrain.py`：预训练实现函数，内含 TrainConfig，支持 --log、--max_steps、--eval_interval、--resume
+- `pretrain.py`：预训练实现函数，内含 TrainConfig，支持 --log、--max_steps、--eval_interval、--resume、--optimizer、--ckpt_dir
 - `sft_data.py`：提供一些处理 question、prompt、answer 的函数，以及 SEED、N_TEST 参数
-- `sft.py`：实现 sft 训练，内含 sft 阶段的数据加载器 SFTLoader，支持 --init、--out、--log、--max_steps
+- `sft.py`：实现 sft 训练，内含 sft 阶段的数据加载器 SFTLoader，支持 --init、--out、--log、--max_steps、--optimizer
 - `eval_sft.py`：提供 evaluate_accuracy 函数，用贪心采样，对测试集计算准确率
 - `generate.py`：提供 generate 函数，简易的批量推理
-- `grpo.py`：实现 grpo 训练，支持 --init、--out、--log、--max_steps、--chunk_size
+- `grpo.py`：实现 grpo 训练，支持 --init、--out、--log、--max_steps、--chunk_size、--optimizer
 - `count_parameters.py`：按公式逐项估算模型参数量
 - `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件
+- `muon.py`：newton_schulz 正交化函数和 Muon 优化器类
 
 ## 复现
 
@@ -120,6 +128,42 @@ mv checkpoints/final.pt checkpoints/latest.pt checkpoints/adamw_112m/
 - 预期：结尾准确率 94.2%，10 次评估平均 82.2%
 - 对比 v0.2（相对各自起点的变化，单位为百分点；起点分别为 37.4% 和 40.0%）：结尾准确率 +32.0 → +54.2，10 次评估平均 +22.1 → +42.2。训练过程中没有出现 v0.2 前 50 步先掉的现象；结尾训练采样奖励约 0.8（v0.2 约 0.40），KL 约 0.2～0.5（v0.2 约 0.11）
 
+**7. Muon 路线**：数据和第 1～2 步相同，各步命令加 `--optimizer muon`，输出放 `checkpoints/muon_112m/`
+
+```bash
+python pretrain.py --optimizer muon --ckpt_dir checkpoints/muon_112m --log logs/pretrain_muon.log
+python sft.py --init checkpoints/muon_112m/final.pt --out checkpoints/muon_112m/sft.pt --optimizer muon --log logs/sft_muon.log
+python sft.py --init checkpoints/muon_112m/final.pt --max_steps 75 --out checkpoints/muon_112m/sft_weak.pt --optimizer muon --log logs/sft_weak_muon.log
+python grpo.py --init checkpoints/muon_112m/sft_weak.pt --out checkpoints/muon_112m/grpo_kl02.pt --optimizer muon --log logs/grpo_muon.log
+```
+
+- 预期：预训练 val loss 约 3.107，SFT 100%，弱起点约 40.8%，GRPO 结尾 84.6%、10 次评估平均 71.5%
+- 中断后在预训练命令后加 `--resume`，会从 `checkpoints/muon_112m/latest.pt` 接着训练；优化器名和 checkpoint 里记录的不一致会直接报错
 
 ## 下一步
-添加 Muon 优化器并与 AdamW 基线对比、实现多卡并行
+
+先把训练这一侧做成框架，推理框架放到之后。按顺序推进：
+
+1. 训练框架化（多卡并行要改训练循环，先把循环统一起来再做会容易得多）
+   - 把现有的各项检查（模型参数量、分词器对拍、续训对比、分块梯度一致性等）整理成 pytest，作为重构的安全网
+   - 把 pretrain.py、sft.py、grpo.py 里重复的训练循环（梯度累积、lr 调度、梯度裁剪、日志、checkpoint）抽成统一的 Trainer，各阶段只提供数据和 loss
+   - 优化器改成类（如 MuonWithAdamW：内部按参数分组，对外是一个优化器）
+   - 实验参数改用配置文件描述
+2. 导出 HF 格式对拍：参数名已与 HF Qwen3 对齐，导出 config.json + safetensors，用 transformers 加载后比较同一输入的 logits，验证模型实现
+3. 多卡并行：上云租 4 卡 5090，依次实现 DDP、ZeRO / FSDP、TP、PP
+4. 性能优化
+   - 先测 MFU，用 torch.profiler 定位瓶颈
+   - 再依次尝试 torch.compile、把自写的 Triton FlashAttention 注册为 custom op 接入、分块计算 lm_head + cross-entropy（不物化完整 logits）
+   - 激活显存优化，如 activation checkpointing
+5. 序列打包：预训练和 SFT 改为打包 + 按文档边界的 varlen attention，避免跨文档的注意力和 padding 浪费
+
+### 之后：推理框架
+- 实现 KV cache、批量调度等，接入 GRPO 的 rollout，并与 vLLM 对照
+
+### 可选
+- 评估：给预训练底座测 HellaSwag 等零样本 benchmark，与同量级的外部模型对比
+- 实验严谨性：两种优化器各自扫 lr，GRPO 多种子重复并加长训练
+- RL 算法：GRPO 加 PPO 式的 ratio + clip、一批采样多次更新，尝试 DAPO 的改进
+- 任务：在 a+b 之外加入更多题型，用于训练和评估
+- 模型结构：支持 MoE
+- CI：测试接入 GitHub Actions
