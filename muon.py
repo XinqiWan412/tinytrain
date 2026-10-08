@@ -47,13 +47,3 @@ class Muon(torch.optim.Optimizer):
                 scale = 0.2 * (max(p.size(0), p.size(1)) ** 0.5)
                 p.add_(u, alpha=-lr*scale)
                 
-
-if __name__ == "__main__":
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    a = torch.rand((768, 2304), device=device)
-    ns = newton_schulz(a)
-    s1 = torch.linalg.svdvals(a)
-    s2 = torch.linalg.svdvals(ns.float())
-    print(f"原矩阵：min={s1.min().item():.4f}, max={s1.max().item():.4f}")
-    print(f"正交化后：min={s2.min().item():.4f}, max={s2.max().item():.4f}")
-    

@@ -63,8 +63,6 @@ def parse_answer(token_ids):
 if __name__ == "__main__":
     n_test = N_TEST
     train, test = split_pairs(SEED, n_test)
-    assert len(train) == 10000 - n_test and len(test) == n_test
-    assert not set(train) & set(test)  # train 和 test 不能有交集
 
     a, b = test[0]
     x, y = build_example(a, b)
@@ -75,6 +73,5 @@ if __name__ == "__main__":
         y_str = "MASK" if yi == -100 else repr(enc.decode([yi]))
         print(f"{i:3d} | x={x_str:20s} | y={y_str}")
 
-    assert len(x) == len(y)
     n_target = sum(1 for t in y if t != -100)
     print(f"\nlen={len(x)}, 参与 loss 的位置数={n_target}")

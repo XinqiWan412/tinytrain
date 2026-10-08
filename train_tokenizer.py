@@ -177,44 +177,6 @@ def load_words(data_dir, max_chars):
     return words, counts
 
 
-def run_tests():
-    # 玩具例子测试
-    assert merge([97, 97, 97], (97, 97), 256) == [256, 97]
-    assert merge([1, 2, 1, 2], (1, 2), 3) == [3, 3]
-    assert PAT.findall("What is 37 + 45?") == ['What', ' is', ' ', '3', '7', ' +', ' ', '4', '5', '?']
-    merges, vocab = train_bpe_slow([list(b"aaabdaaabac")], [1], 3)
-    assert merges == [(97, 97), (97, 98), (256, 257)]
-    assert vocab[258] == b"aaab"
-
-    # 慢版本计时
-    # 导入数据，切成 chunk，counter 计数
-    data_dir = "data/raw/fineweb-edu/sample/10BT"
-    max_chars = 1_000_000
-    words, counts = load_words(data_dir, max_chars)  # 统计词块
-
-    t0 = time.perf_counter()
-    merges_slow, vocab_slow = train_bpe_slow(words, counts, num_merges=1000)
-    t1 = time.perf_counter()
-
-    print(f"train_bpe_slow 用时：{t1 - t0}")  # 用时
-
-    # 玩具例子测试
-    merges, vocab = train_bpe_fast([list(b"aaabdaaabac")], [1], 3)
-    assert merges == [(97, 97), (97, 98), (256, 257)]
-    assert vocab[258] == b"aaab"
-    merges, vocab = train_bpe_fast([list(b"aaaa")], [1], 3)
-    assert merges == [(97, 97), (256, 256)]
-
-    # 快版计时
-    t2 = time.perf_counter()
-    merges_fast, vocab_fast = train_bpe_fast(words, counts, num_merges=1000)
-    t3 = time.perf_counter()
-
-    # 验证两个版本相等
-    assert merges_slow == merges_fast and vocab_slow == vocab_fast
-    print(f"train_bpe_fast 用时：{t3 - t2}")  # 用时
-
-
 def train_tokenizer():
     # 正式训练函数
 
@@ -256,5 +218,5 @@ if __name__ == "__main__":
     if args.train:
         train_tokenizer()
     else:
-        run_tests()
-        
+        parser.print_help()
+    

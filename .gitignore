@@ -4,5 +4,6 @@ checkpoints/
 __pycache__/
 *.pyc
 *.log
+.pytest_cache/
 
 .vscode/

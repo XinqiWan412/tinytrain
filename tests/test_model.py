@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-import model, dataloader
+import model
 
 
 def test_rmsnorm():
@@ -16,7 +16,6 @@ def test_rmsnorm():
     y1 = my_rmsnorm(x)
     y2 = torch_rmsnorm(x)
     assert torch.allclose(y1, y2)
-    print("rmsnorm ok")
 
 
 def test_precompute_rope():
@@ -32,7 +31,6 @@ def test_precompute_rope():
     assert torch.allclose(sin[:, :dh//2], sin[:, dh//2:])
     a, b = cos[1, 1], math.cos(base ** (-2 / dh))
     assert abs(a - b) < 1e-6
-    print("precompute_rope ok")
 
 
 def test_apply_rope():
@@ -45,7 +43,6 @@ def test_apply_rope():
     out = model.apply_rope(x, cos, sin)
     assert torch.allclose(x.norm(dim=-1), out.norm(dim=-1))  # 旋转不改变向量的长度
     assert torch.allclose(x[:, :, 0], out[:, :, 0])  # 位置 0 不旋转
-    print("apply_rope ok")
 
 
 def test_attention():
@@ -63,7 +60,6 @@ def test_attention():
     assert out.shape == (B, T, D)
     assert torch.allclose(out[:, :-1], out2[:, :-1])
     assert not torch.allclose(out[:, -1], out2[:, -1])
-    print('attention ok')
 
 
 def test_mlp():
@@ -76,7 +72,6 @@ def test_mlp():
 
     assert x.shape == out.shape
     assert numel == config.hidden_size * config.intermediate_size * 3
-    print('mlp ok')
 
 
 def test_block():
@@ -98,32 +93,69 @@ def test_block():
 
     assert x.shape == out.shape
     assert numel == expected_numel
-    print('block ok')
 
 
 def test_causal_model():
+    torch.manual_seed(400)
     config = model.ModelConfig()
     m = model.ModelForCausalLM(config)
     numel = sum(p.numel() for p in m.parameters())
     # 取一个 batch
-    data_dir = "./data/tokenized/bpe32k"
-    B, T, device = 2, 16, 'cpu'
-    dtloader = dataloader.DataLoader(data_dir, 'train', B, T, device)
-    x, y = dtloader.next_batch()
+    B, T = 2, 16
+    x = torch.randint(0, config.vocab_size, (B, T))
+    y = torch.randint(0, config.vocab_size, (B, T))
     logits, loss = m(x, y)
 
     assert numel == 112_482_048
     assert logits.shape == (B, T, config.vocab_size)
-    # assert 10.8 <= loss.item() <= 11
-    print(f'loss = {loss.item():.4f}')
-    print('causal_model ok')
+    assert 10.3 <= loss.item() <= 10.7
 
 
-if __name__ == "__main__":
-    test_rmsnorm()
-    test_precompute_rope()
-    test_apply_rope()
-    test_attention()
-    test_mlp()
-    test_block()
-    test_causal_model()
+def test_param_count():
+    config = model.ModelConfig()
+    # 参数
+    hidden_size = config.hidden_size
+    layers = config.num_hidden_layers
+    num_head = config.num_attention_heads
+    num_kv_head = config.num_key_value_heads
+    head_dim = config.head_dim
+    intermediate_state = config.intermediate_size
+    vocab_size = config.vocab_size
+    tie_embedding = config.tie_word_embeddings
+
+    # Attention
+    Wq = hidden_size * num_head * head_dim
+    Wk = hidden_size * num_kv_head * head_dim
+    Wv = Wk
+    Wo = Wq
+    q_norm = head_dim
+    k_norm = q_norm
+    attn_total = Wq + Wk + Wv + Wo + q_norm + k_norm
+
+    # MLP
+    Wup = hidden_size * intermediate_state
+    Wgate = Wup
+    Wdown = Wup
+    mlp_total = Wup + Wgate + Wdown
+
+    # RMSNorm
+    rms_norm_total = 2 * hidden_size
+
+    # Block
+    block = attn_total + mlp_total + rms_norm_total
+
+    # Embedding
+    embedding = vocab_size * hidden_size
+
+    # lm_head
+    lm_head = 0 if tie_embedding else embedding
+
+    # pre lm_head norm
+    norm = hidden_size
+
+    # model total
+    model_total = embedding + block * layers + norm + lm_head
+
+    m = model.ModelForCausalLM(config)
+    assert sum(p.numel() for p in m.parameters()) == model_total
+    

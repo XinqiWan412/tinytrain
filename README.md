@@ -63,23 +63,27 @@
 - `train_tokenizer.py`：训练自己的 BPE 分词器，结果存为 tokenizer_32k.json
 - `tokenizer.py`：加载了特殊 token 的分词器 enc，以及两个输入 str、返回 token_ids(list[int])的 render 函数
 - `model.py`：实现模型结构，内含 load_model 函数、ModelConfig
-- `test_model.py`：用于测试 model.py 的模型各模块是否正确
 - `pretrain.py`：预训练实现函数，内含 TrainConfig，支持 --log、--max_steps、--eval_interval、--resume、--optimizer、--ckpt_dir
 - `sft_data.py`：提供一些处理 question、prompt、answer 的函数，以及 SEED、N_TEST 参数
 - `sft.py`：实现 sft 训练，内含 sft 阶段的数据加载器 SFTLoader，支持 --init、--out、--log、--max_steps、--optimizer
 - `eval_sft.py`：提供 evaluate_accuracy 函数，用贪心采样，对测试集计算准确率
 - `generate.py`：提供 generate 函数，简易的批量推理
 - `grpo.py`：实现 grpo 训练，支持 --init、--out、--log、--max_steps、--chunk_size、--optimizer
-- `count_parameters.py`：按公式逐项估算模型参数量
 - `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件
 - `muon.py`：newton_schulz 正交化函数和 Muon 优化器类
+- `pytest.ini`：配置了测试目录，默认跳过标了 slow 的测试
+- `tests/`：test_model 测模型各模块和参数量，test_tokenizer 测分词器和 BPE 训练（含 2 个慢测试），test_sft_data 测从 (a,b) 构建 x, y 训练数据对，test_pretrain 测 lr 动态计算，test_muon 测 newton_schulz 计算
 
 ## 复现
 
 ### 环境
 - GPU：单张 RTX 4070 Ti Super 16GB，全程 bf16 autocast
 - Python 3.12.14，PyTorch 2.14.0+cu130，CUDA 13.0
-- 其他依赖：tiktoken 0.14.0、numpy 2.5.2、pyarrow 25.0.1
+- 其他依赖：tiktoken 0.14.0、numpy 2.5.2、pyarrow 25.0.1, pytest 9.1.1
+
+### 测试
+`pytest -v`：跑快测试
+`pytest -m slow -v`：跑慢测试
 
 ### 步骤
 
@@ -145,7 +149,6 @@ python grpo.py --init checkpoints/muon_112m/sft_weak.pt --out checkpoints/muon_1
 先把训练这一侧做成框架，推理框架放到之后。按顺序推进：
 
 1. 训练框架化（多卡并行要改训练循环，先把循环统一起来再做会容易得多）
-   - 把现有的各项检查（模型参数量、分词器对拍、续训对比、分块梯度一致性等）整理成 pytest，作为重构的安全网
    - 把 pretrain.py、sft.py、grpo.py 里重复的训练循环（梯度累积、lr 调度、梯度裁剪、日志、checkpoint）抽成统一的 Trainer，各阶段只提供数据和 loss
    - 优化器改成类（如 MuonWithAdamW：内部按参数分组，对外是一个优化器）
    - 实验参数改用配置文件描述

@@ -9,7 +9,6 @@ from muon import Muon
 
 # MODE = "overfit"
 MODE = "train"
-# MODE = "lr"
 # MODE = "load"
 
 
@@ -274,9 +273,6 @@ if __name__ == "__main__":
         else:
             # 从头开始的训练走这里            
             train(m, optimizers, loader, val_loader, train_config, args.optimizer, args.ckpt_dir)
-    elif MODE == "lr":
-        for s in [0, 29, 30, 165, 299, 300]:
-            log(f"s {s}, lr {get_lr(s, train_config):.6e}")
     elif MODE == "load":
         path = "checkpoints/final.pt"
         B, T = train_config.B, train_config.T
