@@ -7,10 +7,6 @@ import argparse
 from logger import log, setup_log
 from muon import Muon
 
-# MODE = "overfit"
-MODE = "train"
-# MODE = "load"
-
 
 @dataclass
 class TrainConfig:
@@ -31,21 +27,6 @@ class TrainConfig:
     eval_steps: int = 20
 
 
-def overfit_single_batch(model, optimizers, loader: dataloader.DataLoader, train_config: TrainConfig):
-    x, y = loader.next_batch()
-    model.train()
-    steps = train_config.max_steps
-    for step in range(steps):
-        zero_grad_all(optimizers)
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss = model(x, y)
-        loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
-        step_all(optimizers)
-        if step % 20 == 0 or step == steps - 1:  # 每 20 步打印一次
-            log(f"step {step} loss {loss.item()}")
-
-
 def train(model: model.ModelForCausalLM, 
         optimizers: list[torch.optim.Optimizer], 
         loader: dataloader.DataLoader, 
@@ -62,6 +43,7 @@ def train(model: model.ModelForCausalLM,
     eval_interval = train_config.eval_interval
     assert global_batch_size % (B*T) == 0
     grad_accum_steps = global_batch_size // (B*T)
+    loss_history, grad_norm_history = [], []
     for step in range(start_step, steps):
         # 每 eval_interval 个 step 就做一次 eval
         if step % eval_interval == 0:
@@ -82,6 +64,8 @@ def train(model: model.ModelForCausalLM,
         lr = get_lr(step, train_config)
         set_lr(optimizers, lr)
         step_all(optimizers)
+        loss_history.append(loss_accum.item())
+        grad_norm_history.append(norm.item())
         if use_cuda:
             torch.cuda.synchronize()
         t1 = time.perf_counter()
@@ -93,6 +77,7 @@ def train(model: model.ModelForCausalLM,
     val_loss = evaluate(model, val_loader, train_config)
     log(f'step:{steps}, val_loss:{val_loss:.4f}')
     save_checkpoint(os.path.join(ckpt_dir, "final.pt"), model, optimizers, optimizer_name, loader, train_config, steps, val_loss)
+    return loss_history, grad_norm_history
 
 
 def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig, optimizer_name):
@@ -214,6 +199,19 @@ def save_checkpoint(path,
     os.replace(tmp_path, path)
 
 
+def load_checkpoint(path, model, optimizers, optimizer_name, loader, device):
+    ckpt = torch.load(path, map_location=device)
+    if ckpt["optimizer_name"] != optimizer_name:
+        raise ValueError(f"上次训练使用的优化器是 {ckpt['optimizer_name']}，这次用的是 {optimizer_name}")
+    model.load_state_dict(ckpt["model"])
+    for optim, state_dict in zip(optimizers, ckpt["optimizers"]):
+        optim.load_state_dict(state_dict)
+    loader.load_state_dict(ckpt["loader"])
+    start_step = ckpt["step"]
+    log(f"resume from step {start_step}")
+    return start_step
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--log", default="logs/pretrain.log")
@@ -240,46 +238,19 @@ if __name__ == "__main__":
 
     config = model.ModelConfig()
 
-    if MODE == "overfit":
-        m = model.ModelForCausalLM(config)
-        m.to(device)
-        optimizers = configure_optimizer(m, train_config, args.optimizer)
+    m = model.ModelForCausalLM(config)
+    m.to(device)
+    optimizers = configure_optimizer(m, train_config, args.optimizer)
 
-        B, T = 4, 128
-        loader = dataloader.DataLoader(data_dir, 'train', B, T, device)
-        overfit_single_batch(m, optimizers, loader, train_config)
-    elif MODE == "train":
-        m = model.ModelForCausalLM(config)
-        m.to(device)
-        optimizers = configure_optimizer(m, train_config, args.optimizer)
-
-        B, T = train_config.B, train_config.T
-        loader = dataloader.DataLoader(data_dir, 'train', B, T, device)
-        val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device)
-        if args.resume:
-            # 断点续训，读取训练中断前的模型、优化器、train loader 的 state_dict
-            ckpt = torch.load(os.path.join(args.ckpt_dir, "latest.pt"), map_location=device)
-            if ckpt["optimizer_name"] != args.optimizer:
-                raise ValueError(f"上次训练使用的优化器是 {ckpt['optimizer_name']}，这次用的是 {args.optimizer}")
-            m.load_state_dict(ckpt["model"])
-            for optim, state_dict in zip(optimizers, ckpt["optimizers"]):
-                optim.load_state_dict(state_dict)
-            loader.load_state_dict(ckpt["loader"])
-            start_step = ckpt["step"]
-            del ckpt  # 注意要释放 ckpt，能省很多显存
-            log(f"resume from step {start_step}")
-            # 开始训练
-            train(m, optimizers, loader, val_loader, train_config, args.optimizer, args.ckpt_dir, start_step=start_step)
-        else:
-            # 从头开始的训练走这里            
-            train(m, optimizers, loader, val_loader, train_config, args.optimizer, args.ckpt_dir)
-    elif MODE == "load":
-        path = "checkpoints/final.pt"
-        B, T = train_config.B, train_config.T
-        val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device)
-        m = model.load_model(path, device)
-        loss = evaluate(m, val_loader, train_config)
-
-        ckpt = torch.load(path, map_location=device)
-        ckpt_loss = ckpt["val_loss"]
-        log(f"loss={loss:.6f}, ckpt_loss={ckpt_loss:.6f}")
+    B, T = train_config.B, train_config.T
+    loader = dataloader.DataLoader(data_dir, 'train', B, T, device)
+    val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device)
+    if args.resume:
+        # 断点续训，读取训练中断前的模型、优化器、train loader 的 state_dict
+        path = os.path.join(args.ckpt_dir, "latest.pt")
+        start_step = load_checkpoint(path, m, optimizers, args.optimizer, loader, device)
+        # 开始训练
+        train(m, optimizers, loader, val_loader, train_config, args.optimizer, args.ckpt_dir, start_step=start_step)
+    else:
+        # 从头开始的训练走这里            
+        train(m, optimizers, loader, val_loader, train_config, args.optimizer, args.ckpt_dir)

@@ -77,21 +77,3 @@ class DataLoader:
         self.shard_idx = state["shard_idx"]
         self._load_shard()
         self.pos = state["pos"]
-
-
-if __name__ == "__main__":
-    data_dir = "./data/tokenized/bpe32k"
-    B = 4
-    T = 512
-    device = "cpu"
-
-    # 测试换页逻辑
-    dataloader = DataLoader(data_dir, 'train', B, T, device)
-    dataloader.pos = len(dataloader.tokens) - B*T
-    dataloader.next_batch()
-    print(dataloader.shard_idx)
-
-    dataloader = DataLoader(data_dir, 'val', B, T, device)
-    dataloader.pos = len(dataloader.tokens) - B*T
-    dataloader.next_batch()
-    print(dataloader.shard_idx)
