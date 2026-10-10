@@ -1,5 +1,4 @@
-import dataloader
-from pretrain import get_lr, TrainConfig
+from pretrain import get_lr
 import math, pytest
 import torch
 from model import ModelForCausalLM, load_model
@@ -79,7 +78,7 @@ BASELINE = {
 
 
 @pytest.mark.parametrize("optimizer_name", ["adamw", "muon"])
-def test_baseline(optimizer_name, tmp_path, make_data_dir, tiny_config):
+def test_pretrain_baseline(optimizer_name, tmp_path, make_data_dir, tiny_config):
     losses, norms, _ = run_train(optimizer_name, tmp_path, tiny_config, make_data_dir)
     expected = BASELINE[optimizer_name]
     assert losses == pytest.approx(expected["losses"], rel=1e-5)
