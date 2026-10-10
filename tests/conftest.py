@@ -1,8 +1,8 @@
-from fileinput import filename
 import pytest
 from model import ModelConfig
 import json
 import numpy as np
+from dataclasses import replace
 
 
 @pytest.fixture
@@ -47,3 +47,9 @@ def make_data_dir(tmp_path):
 
         return data_dir
     return _make
+
+
+@pytest.fixture
+def sft_config(tiny_config):
+    config = replace(tiny_config, vocab_size=32768, max_seq_len=64)
+    return config

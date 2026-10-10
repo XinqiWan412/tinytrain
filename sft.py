@@ -66,13 +66,37 @@ def evaluate(model, test, B, device):
                 x, y = build_example(a, b)
                 examples.append((x, y))
             xs, ys = collate(examples, device)
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss = model(xs, ys)
             loss_accum += loss.item()
     n = (len(test) + B - 1) // B
     loss_accum /= n  # 对 loss 求平均
     model.train()
     return loss_accum
+
+
+def train_sft(model, optimizers, train_config, device, train_pairs, test_pairs, B, seed):
+    model.train()
+    sftloader = SFTLoader(train_pairs, B, device, seed)
+    losses, norms = [], []
+    for step in range(train_config.max_steps):
+        zero_grad_all(optimizers)
+        x, y = sftloader.next_batch()
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, loss = model(x, y)
+        loss.backward()
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
+        lr = get_lr(step, train_config)  # 每步的学习率都在变
+        set_lr(optimizers, lr)
+        step_all(optimizers)
+        losses.append(loss.item())
+        norms.append(norm.item())
+        if step % 10 == 0 or step == train_config.max_steps - 1:  # 定期打印 log
+            log(f"step:{step}, loss:{loss.item():.4f}, lr:{lr:.4e}")
+        if step % train_config.eval_interval == 0 or step == train_config.max_steps - 1:  # 定期打印 val_loss
+            val_loss = evaluate(model, test_pairs, B, device)
+            log(f"step={step}, val_loss={val_loss:.4f}")
+    return losses, norms
 
 
 if __name__ == "__main__":
@@ -89,7 +113,6 @@ if __name__ == "__main__":
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     m = load_model(args.init, device)  # 加载模型
-    m.train()
     log(f"vocab_size: {m.config.vocab_size}")
     # 配置 sft 训练参数
     train_config = TrainConfig(
@@ -102,24 +125,9 @@ if __name__ == "__main__":
     optimizers = configure_optimizer(m, train_config, args.optimizer)  # 加载优化器
     B = 128
     train, test = split_pairs(SEED, N_TEST)  # 取 pairs
-    sftloader = SFTLoader(train, B, device, SEED)
 
     # 训练
-    for step in range(train_config.max_steps):
-        zero_grad_all(optimizers)
-        x, y = sftloader.next_batch()
-        with torch.autocast(device_type=device, dtype=torch.bfloat16):
-            _, loss = m(x, y)
-        loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(m.parameters(), train_config.grad_clip)
-        lr = get_lr(step, train_config)  # 每步的学习率都在变
-        set_lr(optimizers, lr)
-        step_all(optimizers)
-        if step % 10 == 0 or step == train_config.max_steps - 1:  # 定期打印 log
-            log(f"step:{step}, loss:{loss.item():.4f}, lr:{lr:.4e}")
-        if step % train_config.eval_interval == 0 or step == train_config.max_steps - 1:  # 定期打印 val_loss
-            val_loss = evaluate(m, test, B, device)
-            log(f"step={step}, val_loss={val_loss:.4f}")
+    losses, norms = train_sft(m, optimizers, train_config, device, train, test, B, SEED)
     
     # 保存
     save_path = args.out

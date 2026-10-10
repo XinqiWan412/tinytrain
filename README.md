@@ -57,7 +57,7 @@
 - 训练配置：AdamW（betas 0.9/0.95，weight decay 0.1 只加在 2 维参数上）或 Muon + AdamW（--optimizer muon），warmup + 余弦衰减，梯度裁剪 1.0，梯度累积，bf16 autocast
 - SFT：只对答案和 `<|im_end|>` 算 loss
 - GRPO：每题采样 8 次，组内标准化算优势，loss 加对冻结参考模型的 KL 惩罚（k3 估计）
-- GRPO 分块梯度累积：1.12 亿参数时，每步 512 条序列一次前向放不下。compute_loss 把它们分块（`--chunk_size`，默认 128），每块单独做参考模型前向、策略模型前向和 backward，梯度在 .grad 里累加；每块的 loss 和 KL 对块内各行求和后除以总行数，各块梯度之和与不分块时一致（v0.2 小模型上 1 块和 4 块的梯度范数 2.219704 vs 2.219820）
+- GRPO 分块梯度累积：1.12 亿参数时，每步 512 条序列一次前向放不下。compute_loss 把它们分块（`--chunk_size`，默认 128），每块单独做参考模型前向、策略模型前向和 backward，梯度在 .grad 里累加；每块的 loss 和 KL 对块内各行求和后除以总行数，各块梯度之和与不分块时一致（v0.2 小模型上 1 块和 4 块的梯度范数 2.219704 vs 2.219820；现在由 tests/test_grpo.py 的分块一致性测试覆盖）
 - 批量生成按 prompt 长度分组（eval_sft.py 和 grpo.py 的 rollout）：数字逐位切分后，prompt 长度随两个加数的位数变化，而同一批生成要求 prompt 等长
 - 对话格式：与 Qwen3 一致
 
@@ -80,21 +80,23 @@
 - `model.py`：实现模型结构，内含 load_model 函数、ModelConfig
 - `pretrain.py`：预训练实现函数，内含 TrainConfig、train（返回每步 loss 和梯度范数）、save_checkpoint / load_checkpoint，支持 --log、--max_steps、--eval_interval、--resume、--optimizer、--ckpt_dir
 - `sft_data.py`：提供一些处理 question、prompt、answer 的函数，以及 SEED、N_TEST 参数
-- `sft.py`：实现 sft 训练，内含 sft 阶段的数据加载器 SFTLoader，支持 --init、--out、--log、--max_steps、--optimizer
+- `sft.py`：实现 sft 训练，内含 sft 阶段的数据加载器 SFTLoader 和训练循环 train_sft（返回每步 loss 和梯度范数），支持 --init、--out、--log、--max_steps、--optimizer
 - `eval_sft.py`：提供 evaluate_accuracy 函数，用贪心采样，对测试集计算准确率
 - `generate.py`：提供 generate 函数，简易的批量推理
-- `grpo.py`：实现 grpo 训练，支持 --init、--out、--log、--max_steps、--chunk_size、--optimizer
+- `grpo.py`：实现 grpo 训练，内含 rollout、compute_loss 和训练循环 train_grpo（返回每步 loss、KL、梯度范数、平均奖励和有对有错的比例），支持 --init、--out、--log、--max_steps、--chunk_size、--optimizer
 - `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件
 - `muon.py`：newton_schulz 正交化函数和 Muon 优化器类
 - `pytest.ini`：配置了测试目录，默认跳过标了 slow 的测试
 - `tests/`：
-  - `conftest.py`：公共 fixture，tiny_config（2 层、hidden 64、词表 256 的小模型配置）和 make_data_dir（在临时目录造随机 token 的 .bin 分片和 meta.json，可指定片数和每片 token 数）
+  - `conftest.py`：公共 fixture，tiny_config（2 层、hidden 64、词表 256 的小模型配置）、sft_config（在 tiny_config 基础上把词表改成 32768、max_seq_len 改成 64，供用真分词器的 SFT / GRPO 测试使用）和 make_data_dir（在临时目录造随机 token 的 .bin 分片和 meta.json，可指定片数和每片 token 数）
   - `test_model.py`：模型各模块、参数量公式、初始化 loss
   - `test_tokenizer.py`：分词器和 BPE 训练（含 2 个慢测试）
   - `test_sft_data.py`：train / test 切分，构建 x, y 时只有答案和 `<|im_end|>` 参与 loss
   - `test_dataloader.py`：换片、state_dict 往返
   - `test_pretrain.py`：lr 调度；用假数据和小模型在 CPU 上跑 train()：AdamW / Muon 基线（每步 loss 和梯度范数）、单 batch overfit、load_model 读回 logits 一致、续训与一口气跑完逐位一致
   - `test_muon.py`：newton_schulz 正交化后的奇异值范围
+  - `test_sft.py`：16 道题、B=4 在 CPU 上跑 train_sft 10 步（过程中换轮打乱两次），AdamW / Muon 基线
+  - `test_grpo.py`：compute_loss 分块与不分块的 loss、KL、梯度一致；先 SFT 200 步把小模型训到采样时有对有错，再跑 4 步 train_grpo，AdamW / Muon 基线，并断言出现过有对有错的题
 
 
 
@@ -112,10 +114,12 @@
 
 ### 测试
 
-`pytest -v`：跑快测试（25 个，约 7 秒，不需要数据）
+`pytest -v`：跑快测试（30 个，约 14 秒，不需要数据）
 `pytest -m slow -v`：跑慢测试（2 个，需要第 1 步下载的原始数据）
 
 训练循环的测试用假数据和小模型在 CPU 上以 fp32 运行，同一台机器上结果逐位可复现。基线记录的是当前代码每步的 loss 和梯度范数（相对误差 1e-5），只能说明行为没变，不能说明行为正确，所以另有 overfit 测试检查能否学会。有意改变训练行为时（如改 lr 调度）才重录基线，并在提交说明里写明。CPU 测试不覆盖 bf16 autocast 和训练速度。
+
+SFT 和 GRPO 的基线用真分词器和小模型在 CPU 上跑，GRPO 另外记录每步的 KL 和平均奖励。GRPO 基线要求采样时有对有错：如果全对或全错，组内优势全为 0，策略梯度不起作用，基线就测不到它。临时把 compute_loss 里的优势取反时，GRPO 基线会失败而分块测试不受影响。
 
 ### 步骤
 

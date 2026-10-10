@@ -131,6 +131,48 @@ def compute_loss(model: ModelForCausalLM, prompts, responses, advantages, G, dev
     return loss_sum, kl_sum
 
 
+def train_grpo(model, ref_model, optimizers, train_config, device,
+                train_pairs, test_pairs,
+                B, G, beta, chunk_size, seed):
+    rng = random.Random(seed)
+    model.eval()
+    accuracy_rate = evaluate_accuracy(model, test_pairs, 100, device, show_wrong=False)
+    log(f"step:0, accuracy_rate:{accuracy_rate:.4f}")
+    losses, kls, norms, rewards_avgs, mixed_ratios = [], [], [], [], []
+
+    # 训练循环
+    for step in range(train_config.max_steps):
+        pairs = rng.sample(train_pairs, B)  # 抽 B 道题
+        model.eval()
+        prompts, responses, rewards, advantages = rollout(model, pairs, G, device)  # rollout 得到 G 组结果
+        model.train()
+        zero_grad_all(optimizers)
+        loss, kl = compute_loss(model, prompts, responses, advantages, G, device, ref_model, beta, chunk_size)  # GRPO 计算 loss
+        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)  # 梯度裁剪
+        
+        lr = get_lr(step, train_config)  # 每一步动态设置 lr
+        set_lr(optimizers, lr)
+        step_all(optimizers)
+
+        # 打印 step、平均奖励、有对有错的比例、loss
+        rewards = rewards.view(B, G)
+        n_correct = rewards.sum(dim=-1)  # (B,) 每道题在 G 次采样里答对的次数
+        mixed = (n_correct > 0) & (n_correct < G)  # (B,) 是否有对有错的 mask
+        mixed_ratio = mixed.to(torch.float32).mean()
+        losses.append(loss)
+        kls.append(kl)
+        norms.append(norm.item())
+        rewards_avgs.append(rewards.mean().item())
+        mixed_ratios.append(mixed_ratio.item())
+        log(f"step:{step+1}, rewards_avg:{rewards.mean():.4f}, mixed_ratio:{mixed_ratio.item():.4f}, loss:{loss:.4f}, kl:{kl:.2e}")
+        # 定期用测试集评估
+        if (step + 1) % train_config.eval_interval == 0:
+            model.eval()
+            accuracy_rate = evaluate_accuracy(model, test_pairs, 100, device, show_wrong=False)
+            log(f"step:{step+1}, accuracy_rate:{accuracy_rate:.4f}")
+    return losses, kls, norms, rewards_avgs, mixed_ratios
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--max_steps", type=int, default=500)
@@ -142,10 +184,10 @@ if __name__ == "__main__":
     args = parser.parse_args()
     setup_log(args.log)
     log(f"args: {args}")
-
+    torch.manual_seed(SEED)
     train, test = split_pairs(SEED, N_TEST)
 
-    # 创建模型
+    # 加载模型
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(args.init, device)
     model.eval()
@@ -169,36 +211,10 @@ if __name__ == "__main__":
         eval_interval=50,
     )
     optimizers = configure_optimizer(model, train_config, args.optimizer)
-    rng = random.Random(SEED)
-    model.eval()
-    accuracy_rate = evaluate_accuracy(model, test, 100, device, show_wrong=False)
-    log(f"step:0, accuracy_rate:{accuracy_rate:.4f}")
-
-    # 训练循环
-    for step in range(train_config.max_steps):
-        pairs = rng.sample(train, B)  # 抽 B 道题
-        model.eval()
-        prompts, responses, rewards, advantages = rollout(model, pairs, G, device)  # rollout 得到 G 组结果
-        model.train()
-        zero_grad_all(optimizers)
-        loss, kl = compute_loss(model, prompts, responses, advantages, G, device, ref_model, beta, args.chunk_size)  # GRPO 计算 loss
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)  # 梯度裁剪
-        
-        lr = get_lr(step, train_config)  # 每一步动态设置 lr
-        set_lr(optimizers, lr)
-        step_all(optimizers)
-
-        # 打印 step、平均奖励、有对有错的比例、loss
-        rewards = rewards.view(B, G)
-        n_correct = rewards.sum(dim=-1)  # (B,) 每道题在 G 次采样里答对的次数
-        mixed = (n_correct > 0) & (n_correct < G)  # (B,) 是否有对有错的 mask
-        mixed_ratio = mixed.to(torch.float32).mean()
-        log(f"step:{step+1}, rewards_avg:{rewards.mean():.4f}, mixed_ratio:{mixed_ratio.item():.4f}, loss:{loss:.4f}, kl:{kl:.2e}")
-        # 定期用测试集评估
-        if (step + 1) % train_config.eval_interval == 0:
-            model.eval()
-            accuracy_rate = evaluate_accuracy(model, test, 100, device, show_wrong=False)
-            log(f"step:{step+1}, accuracy_rate:{accuracy_rate:.4f}")
+    losses, kls, norms, rewards_avgs, mixed_ratios = train_grpo(
+        model, ref_model, optimizers, train_config, device,
+        train, test, B, G, beta, args.chunk_size, SEED
+    )
 
     # 保存模型
     save_path = args.out
