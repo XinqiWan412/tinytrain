@@ -6,7 +6,8 @@ import argparse, os
 
 from sft_data import build_example, split_pairs, SEED, N_TEST
 from model import load_model
-from pretrain import TrainConfig, configure_optimizer, get_lr, zero_grad_all, set_lr, step_all
+from trainer import Trainer
+from pretrain import TrainConfig, configure_optimizer
 from logger import log, setup_log
 
 
@@ -75,27 +76,35 @@ def evaluate(model, test, B, device):
     return loss_accum
 
 
-def train_sft(model, optimizers, train_config, device, train_pairs, test_pairs, B, seed):
-    model.train()
-    sftloader = SFTLoader(train_pairs, B, device, seed)
-    losses, norms = [], []
-    for step in range(train_config.max_steps):
-        zero_grad_all(optimizers)
-        x, y = sftloader.next_batch()
+class SFTTask:
+    def __init__(self, model, train_pairs, test_pairs, B, device, seed):
+        self.model = model
+        self.test_pairs = test_pairs
+        self.B = B
+        self.device = device
+        self.loader = SFTLoader(train_pairs, B, device, seed)
+
+    def get_parts(self, step):
+        x, y = self.loader.next_batch()
+        return [(x, y)], {}
+    
+    def loss(self, part):
+        x, y = part
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            _, loss = model(x, y)
-        loss.backward()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
-        lr = get_lr(step, train_config)  # 每步的学习率都在变
-        set_lr(optimizers, lr)
-        step_all(optimizers)
-        losses.append(loss.item())
-        norms.append(norm.item())
-        if step % 10 == 0 or step == train_config.max_steps - 1:  # 定期打印 log
-            log(f"step:{step}, loss:{loss.item():.4f}, lr:{lr:.4e}")
-        if step % train_config.eval_interval == 0 or step == train_config.max_steps - 1:  # 定期打印 val_loss
-            val_loss = evaluate(model, test_pairs, B, device)
-            log(f"step={step}, val_loss={val_loss:.4f}")
+            _, loss = self.model(x, y)
+        return loss, {}
+
+    def evaluate(self):
+        val_loss = evaluate(self.model, self.test_pairs, self.B, self.device)
+        return {"val_loss": val_loss}
+
+
+def train_sft(model, optimizers, train_config, device, train_pairs, test_pairs, B, seed):
+    task = SFTTask(model, train_pairs, test_pairs, B, device, seed)
+    trainer = Trainer(model, optimizers, train_config, task)
+    records = trainer.fit()
+    losses = records["loss"]
+    norms = records["norm"]
     return losses, norms
 
 
@@ -121,6 +130,7 @@ if __name__ == "__main__":
         warmup_steps=50,
         max_steps=args.max_steps,
         eval_interval=100,
+        log_interval=10,
     )
     optimizers = configure_optimizer(m, train_config, args.optimizer)  # 加载优化器
     B = 128

@@ -7,7 +7,8 @@ from model import ModelForCausalLM, load_model
 from sft_data import build_xy, split_pairs, SEED, N_TEST, make_question, parse_answer
 from tokenizer import render_prompt, IM_END
 from sft import collate
-from pretrain import TrainConfig, configure_optimizer, get_lr, zero_grad_all, set_lr, step_all
+from trainer import get_lr, zero_grad_all, set_lr, step_all
+from pretrain import TrainConfig, configure_optimizer
 from eval_sft import evaluate_accuracy
 from collections import defaultdict
 import argparse

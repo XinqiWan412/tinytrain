@@ -1,11 +1,12 @@
 import torch
 import numpy as np
 import model, dataloader
-import time, math, os
+import time, os
 from dataclasses import dataclass, asdict
 import argparse
 from logger import log, setup_log
 from muon import Muon
+from trainer import get_lr, set_lr, zero_grad_all, step_all
 
 
 @dataclass
@@ -123,38 +124,6 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         return [muon, adamw]
     else:
         raise ValueError(f"unknown optimizer: {optimizer_name!r}, expected one of: adamw, muon")
-
-
-def zero_grad_all(optimizers):
-    for optim in optimizers:
-        optim.zero_grad()
-
-
-def set_lr(optimizers, lr):
-    for optim in optimizers:
-        for group in optim.param_groups:
-            group["lr"] = lr
-
-
-def step_all(optimizers):
-    for optim in optimizers:
-        optim.step()
-
-
-def get_lr(step, train_config: TrainConfig):
-    # warmup 阶段，lr 从 0 线性上升到 max_lr
-    # 过了warmup，lr 按余弦缓慢下降至 min_lr
-    warmup_steps = train_config.warmup_steps
-    max_steps = train_config.max_steps
-    min_lr, max_lr = train_config.min_lr, train_config.max_lr
-    if step >= max_steps:
-        return min_lr
-    elif step < warmup_steps:
-        return max_lr * (step + 1) / warmup_steps
-    else:
-        ratio = (step - warmup_steps) / (max_steps - warmup_steps)
-        c = 0.5 * (1 + math.cos(math.pi*ratio))
-        return min_lr + c * (max_lr - min_lr)
 
 
 def evaluate(model, val_loader: dataloader.DataLoader, train_config: TrainConfig):
