@@ -1,12 +1,12 @@
 import torch
 import numpy as np
 import model, dataloader
-import time, os
-from dataclasses import dataclass, asdict
+import os
+from dataclasses import dataclass
 import argparse
 from logger import log, setup_log
 from muon import Muon
-from trainer import get_lr, set_lr, zero_grad_all, step_all
+from trainer import Trainer, get_lr  # get_lr 在这里没用，但 test_pretrain 是从这里 import 的，所以要保留
 
 
 @dataclass
@@ -28,6 +28,40 @@ class TrainConfig:
     eval_steps: int = 20
 
 
+class PretrainTask:
+    def __init__(self, model, loader, val_loader, train_config):
+        self.model = model
+        self.loader = loader
+        self.val_loader = val_loader
+        self.train_config = train_config
+        B, T = self.loader.B, self.loader.T
+        global_batch_size = self.train_config.global_batch_size
+        assert global_batch_size % (B*T) == 0
+        self.grad_accum_steps = global_batch_size // (B*T)
+        self.tokens_per_step = B*T*self.grad_accum_steps
+
+    def get_parts(self, step):
+        res = []
+        for _ in range(self.grad_accum_steps):
+            x, y = self.loader.next_batch()
+            res.append((x, y))
+        return res, {}
+
+    def loss(self, part):
+        x, y = part
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            _, loss = self.model(x, y)
+            loss = loss / self.grad_accum_steps
+        return loss, {}
+
+    def evaluate(self):
+        loss_avg = evaluate(self.model, self.val_loader, self.train_config)
+        return {"val_loss": loss_avg}
+
+    def state_dict(self):
+        return {"loader": self.loader.state_dict()}
+
+
 def train(model: model.ModelForCausalLM, 
         optimizers: list[torch.optim.Optimizer], 
         loader: dataloader.DataLoader, 
@@ -36,49 +70,10 @@ def train(model: model.ModelForCausalLM,
         optimizer_name,
         ckpt_dir,
         start_step=0):
-    model.train()
-    B, T = loader.B, loader.T
-    use_cuda = torch.cuda.is_available()
-    steps, log_interval = train_config.max_steps, train_config.log_interval
-    global_batch_size = train_config.global_batch_size
-    eval_interval = train_config.eval_interval
-    assert global_batch_size % (B*T) == 0
-    grad_accum_steps = global_batch_size // (B*T)
-    loss_history, grad_norm_history = [], []
-    for step in range(start_step, steps):
-        # 每 eval_interval 个 step 就做一次 eval
-        if step % eval_interval == 0:
-            val_loss = evaluate(model, val_loader, train_config)
-            log(f'step:{step}, val_loss:{val_loss:.4f}')
-            save_checkpoint(os.path.join(ckpt_dir, "latest.pt"), model, optimizers, optimizer_name, loader, train_config, step, val_loss)
-        t0 = time.perf_counter()
-        zero_grad_all(optimizers)
-        loss_accum = 0.0
-        for _ in range(grad_accum_steps):
-            x, y = loader.next_batch()
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                _, loss = model(x, y)
-                loss = loss / grad_accum_steps
-            loss.backward()
-            loss_accum += loss.detach()
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)
-        lr = get_lr(step, train_config)
-        set_lr(optimizers, lr)
-        step_all(optimizers)
-        loss_history.append(loss_accum.item())
-        grad_norm_history.append(norm.item())
-        if use_cuda:
-            torch.cuda.synchronize()
-        t1 = time.perf_counter()
-        dt = t1 - t0
-        if step % log_interval == 0 or step == steps - 1:
-            log(f"step:{step}, loss:{loss_accum.item():.4f}, dt:{dt*1000:.1f}ms, tok/s:{B*T/dt*grad_accum_steps:.0f}, norm:{norm.item():.4f}, lr:{lr:.4e}")
-
-    # 最后做一次 eval
-    val_loss = evaluate(model, val_loader, train_config)
-    log(f'step:{steps}, val_loss:{val_loss:.4f}')
-    save_checkpoint(os.path.join(ckpt_dir, "final.pt"), model, optimizers, optimizer_name, loader, train_config, steps, val_loss)
-    return loss_history, grad_norm_history
+    task = PretrainTask(model, loader, val_loader, train_config)
+    trainer = Trainer(model, optimizers, train_config, task, ckpt_dir=ckpt_dir, optimizer_name=optimizer_name)
+    records = trainer.fit(start_step)
+    return records["loss"], records["norm"]
 
 
 def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig, optimizer_name):
@@ -140,32 +135,6 @@ def evaluate(model, val_loader: dataloader.DataLoader, train_config: TrainConfig
     loss_avg = loss_accum / eval_steps
     model.train()
     return loss_avg.item()
-
-
-def save_checkpoint(path, 
-                    model: model.ModelForCausalLM, 
-                    optimizers: list[torch.optim.Optimizer], 
-                    optimizer_name,
-                    loader: dataloader.DataLoader, 
-                    train_config: TrainConfig, 
-                    step, val_loss):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    checkpoint = {
-        # 用模型需要的
-        "model": model.state_dict(),
-        "model_config": asdict(model.config),
-        # 接着训需要的
-        "optimizers": [optim.state_dict() for optim in optimizers],
-        "optimizer_name": optimizer_name,
-        "step": step,  # 从这一步继续训
-        "loader": loader.state_dict(),
-        # 留作记录的
-        "train_config": asdict(train_config),
-        "val_loss": val_loss,
-    }
-    tmp_path = path + ".tmp"
-    torch.save(checkpoint, tmp_path)
-    os.replace(tmp_path, path)
 
 
 def load_checkpoint(path, model, optimizers, optimizer_name, loader, device):

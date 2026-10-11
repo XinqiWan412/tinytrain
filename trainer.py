@@ -1,5 +1,6 @@
-import math, collections, torch
+import math, collections, torch, os, time
 from logger import log
+from dataclasses import asdict
 
 
 def get_lr(step, train_config):
@@ -35,17 +36,21 @@ def step_all(optimizers):
 
 
 class Trainer:
-    def __init__(self, model, optimizers, train_config, task):
+    def __init__(self, model, optimizers, train_config, task, ckpt_dir=None, optimizer_name=None):
         self.model = model
         self.optimizers = optimizers
         self.train_config = train_config
         self.task = task
+        self.ckpt_dir = ckpt_dir
+        self.optimizer_name = optimizer_name
+        self.tokens_per_step = getattr(self.task, "tokens_per_step", None)
 
     def fit(self, start_step=0):
         records = collections.defaultdict(list)  # 记录返回值
         self._eval(start_step)  # 开始前的 eval
 
         for step in range(start_step, self.train_config.max_steps):
+            t0 = time.perf_counter()
             # 拿数据
             parts, step_extra = self.task.get_parts(step)
             self.model.train()
@@ -58,7 +63,7 @@ class Trainer:
                 loss, part_extra = self.task.loss(part)
                 loss.backward()
                 loss_accum += loss.detach()
-                # 存 GRPO 的额外参数，adv, rewards
+                # 存额外参数，如 GRPO 的 kl
                 for k, v in part_extra.items():
                     part_extra_acc[k] = part_extra_acc.get(k, 0.0) + v
             # 梯度裁剪
@@ -68,6 +73,10 @@ class Trainer:
             set_lr(self.optimizers, lr)
             # step
             step_all(self.optimizers)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            dt = t1 - t0
             # 记录
             loss_value = loss_accum.item()
             norm_value = norm.item()
@@ -81,18 +90,44 @@ class Trainer:
             # 打印 log
             if step % self.train_config.log_interval == 0 or step == self.train_config.max_steps - 1:
                 extra_text = "".join(f", {k}:{v:.4g}" for k, v in extras.items())
-                log(f"step:{step}, loss:{loss_value:.4f}, norm:{norm_value:.4f}, lr:{lr:.4e}{extra_text}")
+                tok_text = f", tok/s:{self.tokens_per_step/dt:.0f}" if self.tokens_per_step is not None else ""
+                log(f"step:{step}, loss:{loss_value:.4f}, norm:{norm_value:.4f}, lr:{lr:.4e}{extra_text}, dt:{dt*1000:.1f}ms{tok_text}")
             # 定期 eval
-            if (step + 1) % self.train_config.eval_interval == 0 or step == self.train_config.max_steps - 1:
+            if step == self.train_config.max_steps - 1:
+                self._eval(step + 1, final=True)  # 最后一步，final = True
+            elif (step + 1) % self.train_config.eval_interval == 0:
                 self._eval(step + 1)
         return dict(records)
 
     
-    def _eval(self, step):
+    def _eval(self, step, final=False):
         # 做 eval
         self.model.eval()
         metrics = self.task.evaluate()
         text = ", ".join(f"{k}:{v:.4f}" for k, v in metrics.items())
         # 打印 log
         log(f"step:{step}, {text}")
+        if self.ckpt_dir is not None:
+            # 存 checkpoint
+            filename = "final.pt" if final else "latest.pt"
+            self._save(os.path.join(self.ckpt_dir, filename), step, metrics)
         self.model.train()
+
+
+    def _save(self, path, step, metrics):
+        checkpoint = {
+            # 用模型需要的
+            "model": self.model.state_dict(),
+            "model_config": asdict(self.model.config),
+            # 接着训需要的
+            "optimizers": [optim.state_dict() for optim in self.optimizers],
+            "optimizer_name": self.optimizer_name,
+            "step": step,  # 从这一步继续训
+            # 留作记录的
+            "train_config": asdict(self.train_config),
+        }
+        checkpoint = {**checkpoint, **self.task.state_dict(), **metrics}
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp_path = path + ".tmp"
+        torch.save(checkpoint, tmp_path)
+        os.replace(tmp_path, path)
