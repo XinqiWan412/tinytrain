@@ -55,6 +55,7 @@
 
 - 模型结构：配置为 hidden 768、12 层、8 头 / 2 KV 头（head_dim 128）、FFN 2304，共 1.12 亿参数（v0.2 为 hidden 256、4 层、FFN 768，1150 万参数）
 - 训练配置：AdamW（betas 0.9/0.95，weight decay 0.1 只加在 2 维参数上）或 Muon + AdamW（--optimizer muon），warmup + 余弦衰减，梯度裁剪 1.0，梯度累积，bf16 autocast
+- 训练骨架：三个阶段共用 trainer.py 的 Trainer，它负责每步的公共流程（清梯度 → 逐份算 loss 并 backward → 梯度裁剪 → 设 lr → step → 记录、日志、eval、checkpoint）。各阶段写一个小类（PretrainTask、SFTTask、GRPOTask），用同名方法提供各自不同的部分：get_parts（这一步的数据分成几份，以及 rollout 奖励这类额外数字）、loss（每份缩放好的 loss）、evaluate（val loss 或准确率），预训练另有 state_dict（DataLoader 位置）。每份 loss 怎么缩放、autocast 包在哪里由阶段决定，Trainer 只负责让各份梯度相加
 - SFT：只对答案和 `<|im_end|>` 算 loss
 - GRPO：每题采样 8 次，组内标准化算优势，loss 加对冻结参考模型的 KL 惩罚（k3 估计）
 - GRPO 分块梯度累积：1.12 亿参数时，每步 512 条序列一次前向放不下。compute_loss 把它们分块（`--chunk_size`，默认 128），每块单独做参考模型前向、策略模型前向和 backward，梯度在 .grad 里累加；每块的 loss 和 KL 对块内各行求和后除以总行数，各块梯度之和与不分块时一致（v0.2 小模型上 1 块和 4 块的梯度范数 2.219704 vs 2.219820；现在由 tests/test_grpo.py 的分块一致性测试覆盖）
@@ -67,7 +68,7 @@
 
 - 长时间训练：日志（logger.py，pretrain/sft/grpo 共用）在 print 的同时追加写进文件、每行 flush；断点续训保存模型、优化器、步数和 DataLoader 位置（DataLoader 提供 state_dict / load_state_dict），checkpoint 先写临时文件再用 os.replace 替换，写到一半被打断也不会损坏旧文件
 - 数据切分：一次处理目录下所有 parquet，分片编号跨文件连续；val 固定为第一个文件开头的 1000 万 token，增加数据后结果仍能和之前比较
-- Muon（muon.py）：动量（0.95，Nesterov）之后用 Newton-Schulz 迭代 5 次把动量矩阵近似正交化（只用矩阵乘，bf16），让各奇异方向的步长一致；更新系数用 Moonlight 的 0.2×√max(行, 列)，使更新幅度与 AdamW 对齐，lr、weight decay 和调度都直接沿用 AdamW；按参数形状分组：块内的 2 维矩阵（q/k/v/o 和 MLP 三个矩阵）用 Muon，embedding（与 lm_head 共享）和 1 维 norm 参数仍用 AdamW；configure_optimizer 返回优化器列表，训练循环通过 zero_grad_all / set_lr / step_all 统一操作
+- Muon（muon.py）：动量（0.95，Nesterov）之后用 Newton-Schulz 迭代 5 次把动量矩阵近似正交化（只用矩阵乘，bf16），让各奇异方向的步长一致；更新系数用 Moonlight 的 0.2×√max(行, 列)，使更新幅度与 AdamW 对齐，lr、weight decay 和调度都直接沿用 AdamW；按参数形状分组：块内的 2 维矩阵（q/k/v/o 和 MLP 三个矩阵）用 Muon，embedding（与 lm_head 共享）和 1 维 norm 参数仍用 AdamW；configure_optimizer 返回优化器列表，Trainer 通过 zero_grad_all / set_lr / step_all 统一操作
 
 
 
@@ -78,12 +79,13 @@
 - `train_tokenizer.py`：训练自己的 BPE 分词器，结果存为 tokenizer_32k.json
 - `tokenizer.py`：加载了特殊 token 的分词器 enc，以及两个输入 str、返回 token_ids(list[int])的 render 函数
 - `model.py`：实现模型结构，内含 load_model 函数、ModelConfig
-- `pretrain.py`：预训练实现函数，内含 TrainConfig、train（返回每步 loss 和梯度范数）、save_checkpoint / load_checkpoint，支持 --log、--max_steps、--eval_interval、--resume、--optimizer、--ckpt_dir
+- `pretrain.py`：预训练，内含 TrainConfig、configure_optimizer、PretrainTask（每步取 grad_accum 份数据、提供 DataLoader 状态给 checkpoint）、train（薄外壳，返回每步 loss 和梯度范数）、load_checkpoint，支持 --log、--max_steps、--eval_interval、--resume、--optimizer、--ckpt_dir
 - `sft_data.py`：提供一些处理 question、prompt、answer 的函数，以及 SEED、N_TEST 参数
-- `sft.py`：实现 sft 训练，内含 sft 阶段的数据加载器 SFTLoader 和训练循环 train_sft（返回每步 loss 和梯度范数），支持 --init、--out、--log、--max_steps、--optimizer
+- `sft.py`：SFT，内含数据加载器 SFTLoader、SFTTask 和 train_sft（薄外壳，返回每步 loss 和梯度范数），支持 --init、--out、--log、--max_steps、--optimizer
 - `eval_sft.py`：提供 evaluate_accuracy 函数，用贪心采样，对测试集计算准确率
 - `generate.py`：提供 generate 函数，简易的批量推理
-- `grpo.py`：实现 grpo 训练，内含 rollout、compute_loss 和训练循环 train_grpo（返回每步 loss、KL、梯度范数、平均奖励和有对有错的比例），支持 --init、--out、--log、--max_steps、--chunk_size、--optimizer
+- `grpo.py`：GRPO，内含 rollout、build_rows（拼行补齐）、chunk_loss（算一块的 loss 和 KL）、compute_loss（分块算 loss 并 backward，供测试使用）、GRPOTask 和 train_grpo（薄外壳，返回每步 loss、KL、梯度范数、平均奖励和有对有错的比例），支持 --init、--out、--log、--max_steps、--chunk_size、--optimizer
+- `trainer.py`：通用训练骨架。get_lr、zero_grad_all、set_lr、step_all 几个小函数，以及 Trainer 类（清梯度、逐份 backward、梯度裁剪、lr 调度、记录、日志、按间隔 eval、可选的 checkpoint 保存和 tok/s）
 - `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件
 - `muon.py`：newton_schulz 正交化函数和 Muon 优化器类
 - `pytest.ini`：配置了测试目录，默认跳过标了 slow 的测试
@@ -193,7 +195,7 @@ python grpo.py --init checkpoints/muon_112m/sft_weak.pt --out checkpoints/muon_1
 先把训练这一侧做成框架，推理框架放到之后。按顺序推进：
 
 1. 训练框架化（多卡并行要改训练循环，先把循环统一起来再做会容易得多）
-  - 把 pretrain.py、sft.py、grpo.py 里重复的训练循环（梯度累积、lr 调度、梯度裁剪、日志、checkpoint）抽成统一的 Trainer，各阶段只提供数据和 loss
+  - 已完成：把 pretrain.py、sft.py、grpo.py 里重复的训练循环（梯度累积、lr 调度、梯度裁剪、日志、checkpoint）抽成统一的 Trainer，各阶段只提供数据和 loss
   - 优化器改成类（如 MuonWithAdamW：内部按参数分组，对外是一个优化器）
   - 实验参数改用配置文件描述
 2. 导出 HF 格式对拍：参数名已与 HF Qwen3 对齐，导出 config.json + safetensors，用 transformers 加载后比较同一输入的 logits，验证模型实现
