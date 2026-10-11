@@ -7,7 +7,7 @@ from model import ModelForCausalLM, load_model
 from sft_data import build_xy, split_pairs, SEED, N_TEST, make_question, parse_answer
 from tokenizer import render_prompt, IM_END
 from sft import collate
-from trainer import get_lr, zero_grad_all, set_lr, step_all
+from trainer import Trainer
 from pretrain import TrainConfig, configure_optimizer
 from eval_sft import evaluate_accuracy
 from collections import defaultdict
@@ -87,91 +87,105 @@ def token_logprobs(model, xs, ys):
     return -nll  # 取负号是因为函数要返回 "logprobs"
 
 
-def compute_loss(model: ModelForCausalLM, prompts, responses, advantages, G, device, ref_model: ModelForCausalLM, beta, chunk_size):
-    # 用 rollout 的结果，计算 loss
+def build_rows(prompts, responses, G, device):
     examples = []
     for i, resp in enumerate(responses):
         prompt = prompts[i // G]
         x, y = build_xy(prompt, resp)
         examples.append((x, y))
     xs, ys = collate(examples, device)  # (B*G, L)
-    N = xs.shape[0]  # 总行数
+    return xs, ys
 
+
+def chunk_loss(model, ref_model, xs_c, ys_c, adv_c, N, beta):
+    if beta > 0:
+        # 启动 KL 散度
+        with torch.no_grad():
+            ref_logp = token_logprobs(ref_model, xs_c, ys_c)
+    else:
+        # 不启动 KL 散度
+        ref_logp = None
+        kl = 0.0
+
+    # 计算 GRPO 的 loss
+    logp = token_logprobs(model, xs_c, ys_c)
+    mask = (ys_c != -100).to(torch.float32)  # (C, L)
+    nll = (-logp * mask).sum(dim=-1) / mask.sum(dim=-1)  # (C,)，行内求平均，得到这一行的 loss
+    loss = (adv_c * nll).sum() / N  # 每行乘以优势，再跨行求平均
+
+    if ref_logp is not None:
+        # ref_logp 非空，启动 kl 散度
+        d = ref_logp - logp  # (C, L)
+        kl_tok = torch.exp(d) - d - 1  # (C, L)
+        kl = (kl_tok * mask).sum(dim=-1) / mask.sum(dim=-1)  # 先行内求平均
+        kl = kl.sum() / N  # 再跨行求平均
+        loss = loss + beta * kl  # loss 加上 kl
+        kl = kl.item()
+    return loss, kl
+
+
+def compute_loss(model: ModelForCausalLM, prompts, responses, advantages, G, device, ref_model: ModelForCausalLM, beta, chunk_size):
+    # 已经做完 rollout 了，用 rollout 的结果计算 loss
+    xs, ys = build_rows(prompts, responses, G, device)
+    N = xs.shape[0]  # 总行数
     loss_sum, kl_sum = 0.0, 0.0
     for i in range(0, N, chunk_size):
+        # 切出一块
         xs_c = xs[i:i+chunk_size]
         ys_c = ys[i:i+chunk_size]
         adv_c = advantages[i:i+chunk_size]
-
-        if beta > 0:
-            # 启动 KL 散度
-            with torch.no_grad():
-                ref_logp = token_logprobs(ref_model, xs_c, ys_c)
-        else:
-            # 不启动 KL 散度
-            ref_logp = None
-
-        # 计算 GRPO 的 loss
-        logp = token_logprobs(model, xs_c, ys_c)
-        mask = (ys_c != -100).to(torch.float32)  # (C, L)
-        nll = (-logp * mask).sum(dim=-1) / mask.sum(dim=-1)  # (C,)，行内求平均，得到这一行的 loss
-        loss = (adv_c * nll).sum() / N  # 每行乘以优势，再跨行求平均
-
-        if ref_logp is not None:
-            # ref_logp 非空，启动 kl 散度
-            d = ref_logp - logp  # (C, L)
-            kl_tok = torch.exp(d) - d - 1  # (C, L)
-            kl = (kl_tok * mask).sum(dim=-1) / mask.sum(dim=-1)  # 先行内求平均
-            kl = kl.sum() / N  # 再跨行求平均
-            loss = loss + beta * kl  # loss 加上 kl
-            kl_sum += kl.item()
-        
+        # 算 loss，kl
+        loss, kl = chunk_loss(model, ref_model, xs_c, ys_c, adv_c, N, beta)
+        kl_sum += kl
         loss.backward()
         loss_sum += loss.item()
-
     return loss_sum, kl_sum
+
+
+class GRPOTask:
+    def __init__(self, model, ref_model, train_pairs, test_pairs, B, G, beta, chunk_size, device, seed):
+        self.model = model
+        self.ref_model = ref_model
+        self.train_pairs = train_pairs
+        self.test_pairs = test_pairs
+        self.B = B
+        self.G = G
+        self.beta = beta
+        self.chunk_size = chunk_size
+        self.device = device
+        self.rng = random.Random(seed)
+
+    def get_parts(self, step):
+        pairs = self.rng.sample(self.train_pairs, self.B)  # 抽 B 道题
+        self.model.eval()
+        prompts, responses, rewards, advantages = rollout(self.model, pairs, self.G, self.device)  # rollout 得到 G 组结果
+        xs, ys = build_rows(prompts, responses, self.G, self.device)
+        N, chunk_size = xs.shape[0], self.chunk_size
+        parts = [(xs[i:i+chunk_size], ys[i:i+chunk_size], advantages[i:i+chunk_size], N) for i in range(0, N, chunk_size)]
+        rewards = rewards.view(self.B, self.G)
+        n_correct = rewards.sum(dim=-1)  # (B,) 每道题在 G 次采样里答对的次数
+        mixed = (n_correct > 0) & (n_correct < self.G)  # (B,) 是否有对有错的 mask
+        mixed_ratio = mixed.to(torch.float32).mean().item()
+        rewards_avg = rewards.mean().item()
+        return parts, {"rewards_avg": rewards_avg, "mixed_ratio": mixed_ratio}
+
+    def loss(self, part):
+        xs_c, ys_c, adv_c, N = part
+        loss, kl = chunk_loss(self.model, self.ref_model, xs_c, ys_c, adv_c, N, self.beta)
+        return loss, {"kl": kl}
+    
+    def evaluate(self):
+        accuracy_rate = evaluate_accuracy(self.model, self.test_pairs, 100, self.device, show_wrong=False)
+        return {"accuracy_rate": accuracy_rate}
 
 
 def train_grpo(model, ref_model, optimizers, train_config, device,
                 train_pairs, test_pairs,
                 B, G, beta, chunk_size, seed):
-    rng = random.Random(seed)
-    model.eval()
-    accuracy_rate = evaluate_accuracy(model, test_pairs, 100, device, show_wrong=False)
-    log(f"step:0, accuracy_rate:{accuracy_rate:.4f}")
-    losses, kls, norms, rewards_avgs, mixed_ratios = [], [], [], [], []
-
-    # 训练循环
-    for step in range(train_config.max_steps):
-        pairs = rng.sample(train_pairs, B)  # 抽 B 道题
-        model.eval()
-        prompts, responses, rewards, advantages = rollout(model, pairs, G, device)  # rollout 得到 G 组结果
-        model.train()
-        zero_grad_all(optimizers)
-        loss, kl = compute_loss(model, prompts, responses, advantages, G, device, ref_model, beta, chunk_size)  # GRPO 计算 loss
-        norm = torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.grad_clip)  # 梯度裁剪
-        
-        lr = get_lr(step, train_config)  # 每一步动态设置 lr
-        set_lr(optimizers, lr)
-        step_all(optimizers)
-
-        # 打印 step、平均奖励、有对有错的比例、loss
-        rewards = rewards.view(B, G)
-        n_correct = rewards.sum(dim=-1)  # (B,) 每道题在 G 次采样里答对的次数
-        mixed = (n_correct > 0) & (n_correct < G)  # (B,) 是否有对有错的 mask
-        mixed_ratio = mixed.to(torch.float32).mean()
-        losses.append(loss)
-        kls.append(kl)
-        norms.append(norm.item())
-        rewards_avgs.append(rewards.mean().item())
-        mixed_ratios.append(mixed_ratio.item())
-        log(f"step:{step+1}, rewards_avg:{rewards.mean():.4f}, mixed_ratio:{mixed_ratio.item():.4f}, loss:{loss:.4f}, kl:{kl:.2e}")
-        # 定期用测试集评估
-        if (step + 1) % train_config.eval_interval == 0:
-            model.eval()
-            accuracy_rate = evaluate_accuracy(model, test_pairs, 100, device, show_wrong=False)
-            log(f"step:{step+1}, accuracy_rate:{accuracy_rate:.4f}")
-    return losses, kls, norms, rewards_avgs, mixed_ratios
+    task = GRPOTask(model, ref_model, train_pairs, test_pairs, B, G, beta, chunk_size, device, seed)
+    trainer = Trainer(model, optimizers, train_config, task)
+    records = trainer.fit()
+    return records["loss"], records["kl"], records["norm"], records["rewards_avg"], records["mixed_ratio"]
 
 
 if __name__ == "__main__":
@@ -210,6 +224,7 @@ if __name__ == "__main__":
         warmup_steps=20,
         max_steps=args.max_steps,
         eval_interval=50,
+        log_interval=1,
     )
     optimizers = configure_optimizer(model, train_config, args.optimizer)
     losses, kls, norms, rewards_avgs, mixed_ratios = train_grpo(
