@@ -44,6 +44,7 @@ class Trainer:
         self.ckpt_dir = ckpt_dir
         self.optimizer_name = optimizer_name
         self.tokens_per_step = getattr(self.task, "tokens_per_step", None)
+        self.log_formats = getattr(self.task, "log_formats", {})
 
     def fit(self, start_step=0):
         records = collections.defaultdict(list)  # 记录返回值
@@ -89,7 +90,11 @@ class Trainer:
                 records[k].append(v)
             # 打印 log
             if step % self.train_config.log_interval == 0 or step == self.train_config.max_steps - 1:
-                extra_text = "".join(f", {k}:{v:.4g}" for k, v in extras.items())
+                tmp = []
+                for k, v in extras.items():
+                    fmt = self.log_formats.get(k, ".4g")
+                    tmp.append(f", {k}:{v:{fmt}}")
+                extra_text = "".join(tmp)
                 tok_text = f", tok/s:{self.tokens_per_step/dt:.0f}" if self.tokens_per_step is not None else ""
                 log(f"step:{step}, loss:{loss_value:.4f}, norm:{norm_value:.4f}, lr:{lr:.4e}{extra_text}, dt:{dt*1000:.1f}ms{tok_text}")
             # 定期 eval

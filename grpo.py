@@ -154,6 +154,7 @@ class GRPOTask:
         self.chunk_size = chunk_size
         self.device = device
         self.rng = random.Random(seed)
+        self.log_formats = {"kl": ".2e"}
 
     def get_parts(self, step):
         pairs = self.rng.sample(self.train_pairs, self.B)  # 抽 B 道题
