@@ -180,11 +180,11 @@ class GRPOTask:
         return {"accuracy_rate": accuracy_rate}
 
 
-def train_grpo(model, ref_model, optimizers, train_config, device,
+def train_grpo(model, ref_model, optimizer, train_config, device,
                 train_pairs, test_pairs,
                 B, G, beta, chunk_size, seed):
     task = GRPOTask(model, ref_model, train_pairs, test_pairs, B, G, beta, chunk_size, device, seed)
-    trainer = Trainer(model, optimizers, train_config, task)
+    trainer = Trainer(model, optimizer, train_config, task)
     records = trainer.fit()
     return records["loss"], records["kl"], records["norm"], records["rewards_avg"], records["mixed_ratio"]
 
@@ -227,9 +227,9 @@ if __name__ == "__main__":
         eval_interval=50,
         log_interval=1,
     )
-    optimizers = configure_optimizer(model, train_config, args.optimizer)
+    optimizer = configure_optimizer(model, train_config, args.optimizer)
     losses, kls, norms, rewards_avgs, mixed_ratios = train_grpo(
-        model, ref_model, optimizers, train_config, device,
+        model, ref_model, optimizer, train_config, device,
         train, test, B, G, beta, args.chunk_size, SEED
     )
 

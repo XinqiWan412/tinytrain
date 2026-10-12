@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 import argparse
 from logger import log, setup_log
-from muon import Muon
+from muon import MuonWithAdamW
 from trainer import Trainer, get_lr  # get_lr 在这里没用，但 test_pretrain 是从这里 import 的，所以要保留
 
 
@@ -63,7 +63,7 @@ class PretrainTask:
 
 
 def train(model: model.ModelForCausalLM, 
-        optimizers: list[torch.optim.Optimizer], 
+        optimizer: torch.optim.Optimizer, 
         loader: dataloader.DataLoader, 
         val_loader: dataloader.DataLoader,
         train_config: TrainConfig,
@@ -71,7 +71,7 @@ def train(model: model.ModelForCausalLM,
         ckpt_dir,
         start_step=0):
     task = PretrainTask(model, loader, val_loader, train_config)
-    trainer = Trainer(model, optimizers, train_config, task, ckpt_dir=ckpt_dir, optimizer_name=optimizer_name)
+    trainer = Trainer(model, optimizer, train_config, task, ckpt_dir=ckpt_dir, optimizer_name=optimizer_name)
     records = trainer.fit(start_step)
     return records["loss"], records["norm"]
 
@@ -94,7 +94,7 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
             {"params": keep, "weight_decay": 0.0},
         ]
         optimizer = torch.optim.AdamW(params, lr=lr, betas=betas, fused=True)
-        return [optimizer]
+        return optimizer
     elif optimizer_name == "muon":
         muon_params, wd, keep = [], [], []
         for name, p in model.named_parameters():
@@ -110,13 +110,13 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         keep_numel = sum(p.numel() for p in keep)
         assert muon_params_numel + wd_numel + keep_numel == sum(p.numel() for p in model.parameters())
         log(f"muon: {len(muon_params)} tensors, {muon_params_numel} params | weight_decay: {len(wd)} tensors, {wd_numel} params | no_decay: {len(keep)} tensors, {keep_numel} params")
-        muon = Muon(muon_params, lr=lr, weight_decay=weight_decay)
-        params = [
-            {"params": wd, "weight_decay": weight_decay},
-            {"params": keep, "weight_decay": 0.0},
+        param_groups = [
+            {"params": muon_params, "use_muon": True, "lr": lr, "weight_decay": weight_decay},
+            {"params": wd, "use_muon": False, "lr": lr, "weight_decay": weight_decay, "betas": betas},
+            {"params": keep, "use_muon": False, "lr": lr, "weight_decay": 0.0, "betas": betas},
         ]
-        adamw = torch.optim.AdamW(params, lr=lr, betas=betas, fused=True)
-        return [muon, adamw]
+        optimizer = MuonWithAdamW(param_groups)
+        return optimizer
     else:
         raise ValueError(f"unknown optimizer: {optimizer_name!r}, expected one of: adamw, muon")
 
@@ -137,13 +137,12 @@ def evaluate(model, val_loader: dataloader.DataLoader, train_config: TrainConfig
     return loss_avg.item()
 
 
-def load_checkpoint(path, model, optimizers, optimizer_name, loader, device):
+def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
     ckpt = torch.load(path, map_location=device)
     if ckpt["optimizer_name"] != optimizer_name:
         raise ValueError(f"上次训练使用的优化器是 {ckpt['optimizer_name']}，这次用的是 {optimizer_name}")
     model.load_state_dict(ckpt["model"])
-    for optim, state_dict in zip(optimizers, ckpt["optimizers"]):
-        optim.load_state_dict(state_dict)
+    optimizer.load_state_dict(ckpt["optimizer"])
     loader.load_state_dict(ckpt["loader"])
     start_step = ckpt["step"]
     log(f"resume from step {start_step}")
@@ -178,7 +177,7 @@ if __name__ == "__main__":
 
     m = model.ModelForCausalLM(config)
     m.to(device)
-    optimizers = configure_optimizer(m, train_config, args.optimizer)
+    optimizer = configure_optimizer(m, train_config, args.optimizer)
 
     B, T = train_config.B, train_config.T
     loader = dataloader.DataLoader(data_dir, 'train', B, T, device)
@@ -186,9 +185,9 @@ if __name__ == "__main__":
     if args.resume:
         # 断点续训，读取训练中断前的模型、优化器、train loader 的 state_dict
         path = os.path.join(args.ckpt_dir, "latest.pt")
-        start_step = load_checkpoint(path, m, optimizers, args.optimizer, loader, device)
+        start_step = load_checkpoint(path, m, optimizer, args.optimizer, loader, device)
         # 开始训练
-        train(m, optimizers, loader, val_loader, train_config, args.optimizer, args.ckpt_dir, start_step=start_step)
+        train(m, optimizer, loader, val_loader, train_config, args.optimizer, args.ckpt_dir, start_step=start_step)
     else:
         # 从头开始的训练走这里            
-        train(m, optimizers, loader, val_loader, train_config, args.optimizer, args.ckpt_dir)
+        train(m, optimizer, loader, val_loader, train_config, args.optimizer, args.ckpt_dir)

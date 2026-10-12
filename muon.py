@@ -130,12 +130,17 @@ class MuonWithAdamW(torch.optim.Optimizer):
             # p = p*(1 - lr*wd)
             p.mul_(1 - lr * weight_decay)
             # m = b1*m + (1-b1)*g
-            state["exp_avg"].mul_(beta1).add_(g, alpha=1-beta1)
+            state["exp_avg"].lerp_(g, 1-beta1)
             # v = b2*v + (1-b2)*g*g
             state["exp_avg_sq"].mul_(beta2).addcmul_(g, g, value=1-beta2)
-            # m_hat = m / (1 - b1^t)
-            m_hat = state["exp_avg"] / (1 - beta1 ** state["step"])
-            # v_hat = v / (1 - b2^t)
-            v_hat = state["exp_avg_sq"] / (1 - beta2 ** state["step"])
-            # p = p - lr * m_hat / (sqrt(v_hat) + eps)
-            p.add_(lr * m_hat / (v_hat.sqrt() + eps), alpha=-1)
+            # bias_correction
+            bias_correction1 = 1 - beta1 ** state["step"]
+            bias_correction2 = 1 - beta2 ** state["step"]
+            # step_size = lr / (1 - b1^t)
+            step_size = lr / bias_correction1
+            # denom = (sqrt(v) / sqrt(1 - b2^t)) + eps
+            bias_correction2_sqrt = bias_correction2 ** 0.5
+            denom = (state["exp_avg_sq"].sqrt() / bias_correction2_sqrt).add_(eps)
+            # p = p - step_size * m / denom，数学上等价原公式
+            p.addcdiv_(state["exp_avg"], denom, value=-step_size)
+            

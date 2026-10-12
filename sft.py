@@ -99,9 +99,9 @@ class SFTTask:
         return {"val_loss": val_loss}
 
 
-def train_sft(model, optimizers, train_config, device, train_pairs, test_pairs, B, seed):
+def train_sft(model, optimizer, train_config, device, train_pairs, test_pairs, B, seed):
     task = SFTTask(model, train_pairs, test_pairs, B, device, seed)
-    trainer = Trainer(model, optimizers, train_config, task)
+    trainer = Trainer(model, optimizer, train_config, task)
     records = trainer.fit()
     losses = records["loss"]
     norms = records["norm"]
@@ -132,12 +132,12 @@ if __name__ == "__main__":
         eval_interval=100,
         log_interval=10,
     )
-    optimizers = configure_optimizer(m, train_config, args.optimizer)  # 加载优化器
+    optimizer = configure_optimizer(m, train_config, args.optimizer)  # 加载优化器
     B = 128
     train, test = split_pairs(SEED, N_TEST)  # 取 pairs
 
     # 训练
-    losses, norms = train_sft(m, optimizers, train_config, device, train, test, B, SEED)
+    losses, norms = train_sft(m, optimizer, train_config, device, train, test, B, SEED)
     
     # 保存
     save_path = args.out
