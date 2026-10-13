@@ -19,26 +19,15 @@ def get_lr(step, train_config):
         return min_lr + c * (max_lr - min_lr)
 
 
-def set_lr(optimizers, lr):
-    for optim in optimizers:
-        for group in optim.param_groups:
-            group["lr"] = lr
-
-
-def zero_grad_all(optimizers):
-    for optim in optimizers:
-        optim.zero_grad()
-
-
-def step_all(optimizers):
-    for optim in optimizers:
-        optim.step()
+def set_lr(optimizer, lr):
+    for group in optimizer.param_groups:
+        group["lr"] = lr
 
 
 class Trainer:
-    def __init__(self, model, optimizers, train_config, task, ckpt_dir=None, optimizer_name=None):
+    def __init__(self, model, optimizer, train_config, task, ckpt_dir=None, optimizer_name=None):
         self.model = model
-        self.optimizers = optimizers
+        self.optimizer = optimizer
         self.train_config = train_config
         self.task = task
         self.ckpt_dir = ckpt_dir
@@ -56,7 +45,7 @@ class Trainer:
             parts, step_extra = self.task.get_parts(step)
             self.model.train()
             # 清梯度
-            zero_grad_all(self.optimizers)
+            self.optimizer.zero_grad()
             loss_accum = 0.0
             part_extra_acc = {}
             # 前向反向
@@ -71,9 +60,9 @@ class Trainer:
             norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
             # 设学习率
             lr = get_lr(step, self.train_config)
-            set_lr(self.optimizers, lr)
+            set_lr(self.optimizer, lr)
             # step
-            step_all(self.optimizers)
+            self.optimizer.step()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
             t1 = time.perf_counter()
@@ -125,7 +114,7 @@ class Trainer:
             "model": self.model.state_dict(),
             "model_config": asdict(self.model.config),
             # 接着训需要的
-            "optimizers": [optim.state_dict() for optim in self.optimizers],
+            "optimizer": self.optimizer.state_dict(),
             "optimizer_name": self.optimizer_name,
             "step": step,  # 从这一步继续训
             # 留作记录的
