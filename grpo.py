@@ -8,11 +8,12 @@ from sft_data import build_xy, split_pairs, SEED, N_TEST, make_question, parse_a
 from tokenizer import render_prompt, IM_END
 from sft import collate
 from trainer import Trainer
-from pretrain import TrainConfig, configure_optimizer
+from pretrain import configure_optimizer
 from eval_sft import evaluate_accuracy
 from collections import defaultdict
 import argparse
 from logger import log, setup_log
+from config import TrainConfig, GRPOConfig
 
 
 def rollout(model: ModelForCausalLM, pairs, G, device):
@@ -203,17 +204,16 @@ if __name__ == "__main__":
     torch.manual_seed(SEED)
     train, test = split_pairs(SEED, N_TEST)
 
+    grpo_config = GRPOConfig(chunk_size=args.chunk_size)
+
     # 加载模型
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = load_model(args.init, device)
     model.eval()
-    G = 8  # 重复推理 G 次
-    B = 64  # batch
 
     # 加载参考模型
-    beta = 0.2
     ref_model = None
-    if beta > 0:
+    if grpo_config.beta > 0:
         ref_model = load_model(args.init, device)
         ref_model.eval()
         ref_model.requires_grad_(False)
@@ -226,11 +226,12 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         eval_interval=50,
         log_interval=1,
+        optimizer=args.optimizer,
     )
     optimizer = configure_optimizer(model, train_config, args.optimizer)
     losses, kls, norms, rewards_avgs, mixed_ratios = train_grpo(
         model, ref_model, optimizer, train_config, device,
-        train, test, B, G, beta, args.chunk_size, SEED
+        train, test, grpo_config.B, grpo_config.G, grpo_config.beta, grpo_config.chunk_size, SEED
     )
 
     # 保存模型

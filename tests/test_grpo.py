@@ -1,6 +1,7 @@
 import copy
 from grpo import compute_loss, train_grpo
-from pretrain import TrainConfig, configure_optimizer
+from pretrain import configure_optimizer
+from config import TrainConfig
 from sft import train_sft
 from tokenizer import render_prompt, render_answer, enc
 from sft_data import SEED, make_question

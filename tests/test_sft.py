@@ -1,6 +1,7 @@
 from sft import train_sft
 from sft_data import SEED, N_TEST, split_pairs
-from pretrain import TrainConfig, configure_optimizer
+from pretrain import configure_optimizer
+from config import TrainConfig
 from model import ModelForCausalLM
 import torch, pytest
 

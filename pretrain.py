@@ -2,40 +2,21 @@ import torch
 import numpy as np
 import model, dataloader
 import os
-from dataclasses import dataclass
 import argparse
 from logger import log, setup_log
 from muon import MuonWithAdamW
-from trainer import Trainer, get_lr  # get_lr 在这里没用，但 test_pretrain 是从这里 import 的，所以要保留
-
-
-@dataclass
-class TrainConfig:
-    data_dir: str = "./data/tokenized/bpe32k"
-    B: int = 16
-    T: int = 512
-    global_batch_size: int = 65536
-    max_lr: float = 1e-3
-    min_lr: float = 1e-4
-    warmup_steps: int = 1000
-    max_steps: int = 34000
-    weight_decay: float = 0.1
-    betas: tuple = (0.9, 0.95)
-    grad_clip: float = 1.0
-    seed: int = 42
-    log_interval: int = 20
-    eval_interval: int = 250
-    eval_steps: int = 20
+from trainer import Trainer
+from config import TrainConfig, DataConfig
 
 
 class PretrainTask:
-    def __init__(self, model, loader, val_loader, train_config):
+    def __init__(self, model, loader, val_loader, data_config):
         self.model = model
         self.loader = loader
         self.val_loader = val_loader
-        self.train_config = train_config
+        self.data_config = data_config
         B, T = self.loader.B, self.loader.T
-        global_batch_size = self.train_config.global_batch_size
+        global_batch_size = self.data_config.global_batch_size
         assert global_batch_size % (B*T) == 0
         self.grad_accum_steps = global_batch_size // (B*T)
         self.tokens_per_step = B*T*self.grad_accum_steps
@@ -55,7 +36,7 @@ class PretrainTask:
         return loss, {}
 
     def evaluate(self):
-        loss_avg = evaluate(self.model, self.val_loader, self.train_config)
+        loss_avg = evaluate(self.model, self.val_loader, self.data_config)
         return {"val_loss": loss_avg}
 
     def state_dict(self):
@@ -67,10 +48,11 @@ def train(model: model.ModelForCausalLM,
         loader: dataloader.DataLoader, 
         val_loader: dataloader.DataLoader,
         train_config: TrainConfig,
+        data_config: DataConfig,
         optimizer_name,
         ckpt_dir,
         start_step=0):
-    task = PretrainTask(model, loader, val_loader, train_config)
+    task = PretrainTask(model, loader, val_loader, data_config)
     trainer = Trainer(model, optimizer, train_config, task, ckpt_dir=ckpt_dir, optimizer_name=optimizer_name)
     records = trainer.fit(start_step)
     return records["loss"], records["norm"]
@@ -121,10 +103,10 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         raise ValueError(f"unknown optimizer: {optimizer_name!r}, expected one of: adamw, muon")
 
 
-def evaluate(model, val_loader: dataloader.DataLoader, train_config: TrainConfig):
+def evaluate(model, val_loader: dataloader.DataLoader, data_config: DataConfig):
     model.eval()
     val_loader.reset()
-    eval_steps = train_config.eval_steps
+    eval_steps = data_config.eval_steps
     loss_accum = 0.0
     for step in range(eval_steps):
         x, y = val_loader.next_batch()
@@ -165,13 +147,15 @@ if __name__ == "__main__":
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     train_config = TrainConfig()
+    data_config = DataConfig()
     if args.max_steps is not None:
         train_config.max_steps = args.max_steps
     if args.eval_interval is not None:
         train_config.eval_interval = args.eval_interval
+    train_config.optimizer = args.optimizer
     torch.manual_seed(train_config.seed)
     np.random.seed(train_config.seed)
-    data_dir = train_config.data_dir
+    data_dir = data_config.data_dir
 
     config = model.ModelConfig()
 
@@ -179,7 +163,7 @@ if __name__ == "__main__":
     m.to(device)
     optimizer = configure_optimizer(m, train_config, args.optimizer)
 
-    B, T = train_config.B, train_config.T
+    B, T = data_config.B, data_config.T
     loader = dataloader.DataLoader(data_dir, 'train', B, T, device)
     val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device)
     if args.resume:
@@ -187,7 +171,7 @@ if __name__ == "__main__":
         path = os.path.join(args.ckpt_dir, "latest.pt")
         start_step = load_checkpoint(path, m, optimizer, args.optimizer, loader, device)
         # 开始训练
-        train(m, optimizer, loader, val_loader, train_config, args.optimizer, args.ckpt_dir, start_step=start_step)
+        train(m, optimizer, loader, val_loader, train_config, data_config, args.optimizer, args.ckpt_dir, start_step=start_step)
     else:
         # 从头开始的训练走这里            
-        train(m, optimizer, loader, val_loader, train_config, args.optimizer, args.ckpt_dir)
+        train(m, optimizer, loader, val_loader, train_config, data_config, args.optimizer, args.ckpt_dir)

@@ -7,9 +7,9 @@ import argparse, os
 from sft_data import build_example, split_pairs, SEED, N_TEST
 from model import load_model
 from trainer import Trainer
-from pretrain import TrainConfig, configure_optimizer
+from pretrain import configure_optimizer
 from logger import log, setup_log
-
+from config import TrainConfig, SFTConfig
 
 def collate(examples, device):
     # 把 examples 变成 xs, ys 两组张量
@@ -119,6 +119,8 @@ if __name__ == "__main__":
     setup_log(args.log)
     log(f"args: {args}")
 
+    sft_config = SFTConfig()
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
     m = load_model(args.init, device)  # 加载模型
@@ -131,13 +133,13 @@ if __name__ == "__main__":
         max_steps=args.max_steps,
         eval_interval=100,
         log_interval=10,
+        optimizer=args.optimizer
     )
     optimizer = configure_optimizer(m, train_config, args.optimizer)  # 加载优化器
-    B = 128
     train, test = split_pairs(SEED, N_TEST)  # 取 pairs
 
     # 训练
-    losses, norms = train_sft(m, optimizer, train_config, device, train, test, B, SEED)
+    losses, norms = train_sft(m, optimizer, train_config, device, train, test, sft_config.B, SEED)
     
     # 保存
     save_path = args.out

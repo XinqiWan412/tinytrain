@@ -1,9 +1,10 @@
-from pretrain import get_lr
+from trainer import get_lr
 import math, pytest
 import torch
 from model import ModelForCausalLM, load_model
-from pretrain import configure_optimizer, TrainConfig, train, load_checkpoint
+from pretrain import configure_optimizer, train, load_checkpoint
 from dataloader import DataLoader
+from config import TrainConfig, DataConfig
 
 B, T = 2, 8
 
@@ -29,23 +30,25 @@ def build(optimizer_name, tmp_path, tiny_config, make_data_dir, n_train=2, token
     config = tiny_config
     model = ModelForCausalLM(config)
     train_config = TrainConfig(
-        B=B,
-        T=T,
         warmup_steps=3,
         max_steps=max_steps,
         eval_interval=5,
+    )
+    data_config = DataConfig(
+        B=B,
+        T=T,
         eval_steps=2,
         global_batch_size=32,
     )
     optimizers = configure_optimizer(model, train_config, optimizer_name)
     loader = DataLoader(data_dir, "train", B, T, device)
     val_loader = DataLoader(data_dir, "val", B, T, device)
-    return model, optimizers, loader, val_loader, train_config
+    return model, optimizers, loader, val_loader, train_config, data_config
 
 
 def run_train(optimizer_name, tmp_path, tiny_config, make_data_dir, n_train=2, tokens_per_shard=None, val_same_as_train=False, max_steps=10):
-    model, optimizers, loader, val_loader, train_config = build(optimizer_name, tmp_path, tiny_config, make_data_dir, n_train, tokens_per_shard, val_same_as_train, max_steps)
-    losses, norms = train(model, optimizers, loader, val_loader, train_config, optimizer_name, tmp_path / "ckpt")
+    model, optimizers, loader, val_loader, train_config, data_config = build(optimizer_name, tmp_path, tiny_config, make_data_dir, n_train, tokens_per_shard, val_same_as_train, max_steps)
+    losses, norms = train(model, optimizers, loader, val_loader, train_config, data_config, optimizer_name, tmp_path / "ckpt")
     return losses, norms, model
 
 
@@ -55,10 +58,10 @@ def test_resume(optimizer_name, tmp_path, tiny_config, make_data_dir):
     ## 完整训练
     losses_A, norms_A, model_A = run_train(optimizer_name, tmp_path, tiny_config, make_data_dir)
     ## 断点续训
-    model_B, optimizers, loader, val_loader, train_config = build(optimizer_name, tmp_path, tiny_config, make_data_dir)  # 初始化
+    model_B, optimizers, loader, val_loader, train_config, data_config = build(optimizer_name, tmp_path, tiny_config, make_data_dir)  # 初始化
     start_step = load_checkpoint(tmp_path / "ckpt" / "latest.pt", model_B, optimizers, optimizer_name, loader, "cpu")  # 加载 checkpoint
     assert start_step == 5  # 默认配置，checkpoint 在 step==5 保存
-    losses_B, norms_B = train(model_B, optimizers, loader, val_loader, train_config, optimizer_name, tmp_path / "ckpt_resume", start_step)  # 断点续训，注意存的路径要和 A 分开
+    losses_B, norms_B = train(model_B, optimizers, loader, val_loader, train_config, data_config, optimizer_name, tmp_path / "ckpt_resume", start_step)  # 断点续训，注意存的路径要和 A 分开
     assert losses_A[start_step:] == losses_B
     assert norms_A[start_step:] == norms_B
     for p_A, p_B in zip(model_A.parameters(), model_B.parameters(), strict=True):
