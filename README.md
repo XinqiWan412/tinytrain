@@ -68,8 +68,7 @@
 
 - 长时间训练：日志（logger.py，pretrain/sft/grpo 共用）在 print 的同时追加写进文件、每行 flush；断点续训保存模型、优化器、步数和 DataLoader 位置（DataLoader 提供 state_dict / load_state_dict），checkpoint 先写临时文件再用 os.replace 替换，写到一半被打断也不会损坏旧文件
 - 数据切分：一次处理目录下所有 parquet，分片编号跨文件连续；val 固定为第一个文件开头的 1000 万 token，增加数据后结果仍能和之前比较
-- Muon（muon.py）：动量（0.95，Nesterov）之后用 Newton-Schulz 迭代 5 次把动量矩阵近似正交化（只用矩阵乘，bf16），让各奇异方向的步长一致；更新系数用 Moonlight 的 0.2×√max(行, 列)，使更新幅度与 AdamW 对齐，lr、weight decay 和调度都直接沿用 AdamW；按参数形状分组：块内的 2 维矩阵（q/k/v/o 和 MLP 三个矩阵）用 Muon，embedding（与 lm_head 共享）和 1 维 norm 参数仍用 AdamW；configure_optimizer 返回优化器列表，Trainer 通过 zero_grad_all / set_lr / step_all 统一操作
-
+- Muon（muon.py）：动量（0.95，Nesterov）之后用 Newton-Schulz 迭代 5 次把动量矩阵近似正交化（只用矩阵乘，bf16），让各奇异方向的步长一致；更新系数用 Moonlight 的 0.2×√max(行, 列)，使更新幅度与 AdamW 对齐，lr、weight decay 和调度都直接沿用 AdamW；按参数形状分组：块内的 2 维矩阵（q/k/v/o 和 MLP 三个矩阵）用 Muon，embedding（与 lm_head 共享）和 1 维 norm 参数仍用 AdamW；两部分装在同一个优化器类 MuonWithAdamW 里：它继承 torch.optim.Optimizer，参数组用 use_muon 标记，step 时按组分别走 Muon 和 AdamW 的更新（AdamW 部分手写，运算顺序与 torch 的非 fused 实现一致，tests/test_muon.py 里与 torch.optim.AdamW 逐步对拍）；configure_optimizer 返回单个优化器，Trainer 直接调用它的 zero_grad / step
 
 
 ## 项目结构
@@ -85,9 +84,9 @@
 - `eval_sft.py`：提供 evaluate_accuracy 函数，用贪心采样，对测试集计算准确率
 - `generate.py`：提供 generate 函数，简易的批量推理
 - `grpo.py`：GRPO，内含 rollout、build_rows（拼行补齐）、chunk_loss（算一块的 loss 和 KL）、compute_loss（分块算 loss 并 backward，供测试使用）、GRPOTask 和 train_grpo（薄外壳，返回每步 loss、KL、梯度范数、平均奖励和有对有错的比例），支持 --init、--out、--log、--max_steps、--chunk_size、--optimizer
-- `trainer.py`：通用训练骨架。get_lr、zero_grad_all、set_lr、step_all 几个小函数，以及 Trainer 类（清梯度、逐份 backward、梯度裁剪、lr 调度、记录、日志、按间隔 eval、可选的 checkpoint 保存和 tok/s）
+- `trainer.py`：通用训练骨架。get_lr、set_lr 两个小函数，以及 Trainer 类（清梯度、逐份 backward、梯度裁剪、lr 调度、记录、日志、按间隔 eval、可选的 checkpoint 保存和 tok/s）
 - `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件
-- `muon.py`：newton_schulz 正交化函数和 Muon 优化器类
+- `muon.py`：newton_schulz 正交化函数和 MuonWithAdamW 优化器类（一个优化器内按参数组分别做 Muon 和 AdamW 更新）
 - `pytest.ini`：配置了测试目录，默认跳过标了 slow 的测试
 - `tests/`：
   - `conftest.py`：公共 fixture，tiny_config（2 层、hidden 64、词表 256 的小模型配置）、sft_config（在 tiny_config 基础上把词表改成 32768、max_seq_len 改成 64，供用真分词器的 SFT / GRPO 测试使用）和 make_data_dir（在临时目录造随机 token 的 .bin 分片和 meta.json，可指定片数和每片 token 数）
@@ -96,14 +95,12 @@
   - `test_sft_data.py`：train / test 切分，构建 x, y 时只有答案和 `<|im_end|>` 参与 loss
   - `test_dataloader.py`：换片、state_dict 往返
   - `test_pretrain.py`：lr 调度；用假数据和小模型在 CPU 上跑 train()：AdamW / Muon 基线（每步 loss 和梯度范数）、单 batch overfit、load_model 读回 logits 一致、续训与一口气跑完逐位一致
-  - `test_muon.py`：newton_schulz 正交化后的奇异值范围
+  - `test_muon.py`：newton_schulz 正交化后的奇异值范围；MuonWithAdamW 的 AdamW 分支与 torch.optim.AdamW 逐步对拍
   - `test_sft.py`：16 道题、B=4 在 CPU 上跑 train_sft 10 步（过程中换轮打乱两次），AdamW / Muon 基线
   - `test_grpo.py`：compute_loss 分块与不分块的 loss、KL、梯度一致；先 SFT 200 步把小模型训到采样时有对有错，再跑 4 步 train_grpo，AdamW / Muon 基线，并断言出现过有对有错的题
 
 
-
 ## 复现
-
 
 
 ### 环境
@@ -113,10 +110,9 @@
 - 其他依赖：tiktoken 0.14.0、numpy 2.5.2、pyarrow 25.0.1, pytest 9.1.1
 
 
-
 ### 测试
 
-`pytest -v`：跑快测试（30 个，约 14 秒，不需要数据）
+`pytest -v`：跑快测试（31 个，约 14 秒，不需要数据）
 `pytest -m slow -v`：跑慢测试（2 个，需要第 1 步下载的原始数据）
 
 训练循环的测试用假数据和小模型在 CPU 上以 fp32 运行，同一台机器上结果逐位可复现。基线记录的是当前代码每步的 loss 和梯度范数（相对误差 1e-5），只能说明行为没变，不能说明行为正确，所以另有 overfit 测试检查能否学会。有意改变训练行为时（如改 lr 调度）才重录基线，并在提交说明里写明。CPU 测试不覆盖 bf16 autocast 和训练速度。
@@ -196,7 +192,7 @@ python grpo.py --init checkpoints/muon_112m/sft_weak.pt --out checkpoints/muon_1
 
 1. 训练框架化（多卡并行要改训练循环，先把循环统一起来再做会容易得多）
   - 已完成：把 pretrain.py、sft.py、grpo.py 里重复的训练循环（梯度累积、lr 调度、梯度裁剪、日志、checkpoint）抽成统一的 Trainer，各阶段只提供数据和 loss
-  - 优化器改成类（如 MuonWithAdamW：内部按参数分组，对外是一个优化器）
+  - 已完成：把 Muon 和 AdamW 合并成一个优化器 MuonWithAdamW，configure_optimizer 返回单个对象
   - 实验参数改用配置文件描述
 2. 导出 HF 格式对拍：参数名已与 HF Qwen3 对齐，导出 config.json + safetensors，用 transformers 加载后比较同一输入的 logits，验证模型实现
 3. 多卡并行：上云租 4 卡 5090，依次实现 DDP、ZeRO / FSDP、TP、PP
