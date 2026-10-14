@@ -1,0 +1,14 @@
+[train]
+max_lr = 2e-5
+min_lr = 2e-6
+max_steps = 500
+warmup_steps = 20
+eval_interval = 50
+log_interval = 1
+seed = 400
+optimizer = "muon"
+
+[run]
+init = "checkpoints/muon_112m/sft_weak.pt"
+out = "checkpoints/muon_112m/grpo_kl02.pt"
+log = "logs/muon_112m/grpo.log"

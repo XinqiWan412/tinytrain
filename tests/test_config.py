@@ -1,5 +1,6 @@
+from pathlib import Path
 import pytest
-from config import load_config, SFTExperiment, TrainConfig, SFTConfig, RunConfig
+from config import PretrainExperiment, load_config, SFTExperiment, TrainConfig, SFTConfig, RunConfig, GRPOExperiment
 
 
 def write_toml(tmp_path, text):
@@ -80,3 +81,17 @@ max_steps = 2000"""
 
     with pytest.raises(ValueError, match="unknown keys"):
         load_config(path, SFTExperiment, sets=["train.max_step=250"])
+
+
+def test_all_configs_load():
+    path = Path(__file__).parent.parent / "configs"
+    config_paths = list(path.rglob("*.toml"))
+    assert len(config_paths) == 8
+    for config_path in config_paths:
+        if config_path.stem.startswith("pretrain"):
+            load_config(config_path, PretrainExperiment)
+        elif config_path.stem.startswith("sft"):
+            load_config(config_path, SFTExperiment)
+        elif config_path.stem.startswith("grpo"):
+            load_config(config_path, GRPOExperiment)
+            

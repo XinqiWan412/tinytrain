@@ -25,7 +25,7 @@ def set_lr(optimizer, lr):
 
 
 class Trainer:
-    def __init__(self, model, optimizer, train_config, task, ckpt_dir=None, optimizer_name=None):
+    def __init__(self, model, optimizer, train_config, task, ckpt_dir=None, optimizer_name=None, config=None):
         self.model = model
         self.optimizer = optimizer
         self.train_config = train_config
@@ -34,6 +34,7 @@ class Trainer:
         self.optimizer_name = optimizer_name
         self.tokens_per_step = getattr(self.task, "tokens_per_step", None)
         self.log_formats = getattr(self.task, "log_formats", {})
+        self.config = config
 
     def fit(self, start_step=0):
         records = collections.defaultdict(list)  # 记录返回值
@@ -118,7 +119,7 @@ class Trainer:
             "optimizer_name": self.optimizer_name,
             "step": step,  # 从这一步继续训
             # 留作记录的
-            "train_config": asdict(self.train_config),
+            "config": asdict(self.config) if self.config is not None else None,
         }
         checkpoint = {**checkpoint, **self.task.state_dict(), **metrics}
         os.makedirs(os.path.dirname(path), exist_ok=True)

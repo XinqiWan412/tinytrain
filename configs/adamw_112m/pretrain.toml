@@ -1,0 +1,6 @@
+[train]
+optimizer = "adamw"
+
+[run]
+ckpt_dir = "checkpoints/adamw_112m"
+log = "logs/adamw_112m/pretrain.log"

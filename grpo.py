@@ -1,3 +1,4 @@
+import json
 import random, os
 from dataclasses import asdict
 import torch
@@ -13,7 +14,7 @@ from eval_sft import evaluate_accuracy
 from collections import defaultdict
 import argparse
 from logger import log, setup_log
-from config import TrainConfig, GRPOConfig
+from config import GRPOExperiment, load_config
 
 
 def rollout(model: ModelForCausalLM, pairs, G, device):
@@ -190,56 +191,51 @@ def train_grpo(model, ref_model, optimizer, train_config, device,
     return records["loss"], records["kl"], records["norm"], records["rewards_avg"], records["mixed_ratio"]
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--max_steps", type=int, default=500)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--init", required=True)
-    parser.add_argument("--log", default="logs/grpo.log")
-    parser.add_argument("--chunk_size", type=int, default=128)
-    parser.add_argument("--optimizer", default="adamw", choices=["adamw", "muon"])
-    args = parser.parse_args()
-    setup_log(args.log)
-    log(f"args: {args}")
-    torch.manual_seed(SEED)
+def main(cfg):
+    torch.manual_seed(cfg.train.seed)
     train, test = split_pairs(SEED, N_TEST)
-
-    grpo_config = GRPOConfig(chunk_size=args.chunk_size)
 
     # 加载模型
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = load_model(args.init, device)
+    model = load_model(cfg.run.init, device)
     model.eval()
 
     # 加载参考模型
     ref_model = None
-    if grpo_config.beta > 0:
-        ref_model = load_model(args.init, device)
+    if cfg.grpo.beta > 0:
+        ref_model = load_model(cfg.run.init, device)
         ref_model.eval()
         ref_model.requires_grad_(False)
 
     # GRPO 训练
-    train_config = TrainConfig(
-        max_lr=2e-5,
-        min_lr=2e-6,
-        warmup_steps=20,
-        max_steps=args.max_steps,
-        eval_interval=50,
-        log_interval=1,
-        optimizer=args.optimizer,
-    )
-    optimizer = configure_optimizer(model, train_config, args.optimizer)
+    optimizer = configure_optimizer(model, cfg.train, cfg.train.optimizer)
     losses, kls, norms, rewards_avgs, mixed_ratios = train_grpo(
-        model, ref_model, optimizer, train_config, device,
-        train, test, grpo_config.B, grpo_config.G, grpo_config.beta, grpo_config.chunk_size, SEED
+        model, ref_model, optimizer, cfg.train, device,
+        train, test, cfg.grpo.B, cfg.grpo.G, cfg.grpo.beta, cfg.grpo.chunk_size, cfg.train.seed
     )
 
     # 保存模型
-    save_path = args.out
+    save_path = cfg.run.out
     checkpoint = {
         "model": model.state_dict(),
         "model_config": asdict(model.config),
+        "config": asdict(cfg),
     }
     tmp_path = save_path + ".tmp"
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, save_path)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--set", action="append", default=[])
+    args = parser.parse_args()
+
+    cfg = load_config(args.config, GRPOExperiment, args.set)
+
+    setup_log(cfg.run.log)
+    log(f"args: {args}")
+    log(f"config:\n{json.dumps(asdict(cfg), indent=2)}")
+
+    main(cfg)

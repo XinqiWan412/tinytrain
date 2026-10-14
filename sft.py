@@ -1,3 +1,4 @@
+import json
 import torch
 import random
 from tokenizer import enc
@@ -9,7 +10,7 @@ from model import load_model
 from trainer import Trainer
 from pretrain import configure_optimizer
 from logger import log, setup_log
-from config import TrainConfig, SFTConfig
+from config import SFTExperiment, load_config
 
 def collate(examples, device):
     # 把 examples 变成 xs, ys 两组张量
@@ -108,45 +109,38 @@ def train_sft(model, optimizer, train_config, device, train_pairs, test_pairs, B
     return losses, norms
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--max_steps", type=int, default=2000)
-    parser.add_argument("--out", required=True)
-    parser.add_argument("--init", required=True)
-    parser.add_argument("--log", default="logs/sft.log")
-    parser.add_argument("--optimizer", default="adamw", choices=["adamw", "muon"])
-    args = parser.parse_args()
-    setup_log(args.log)
-    log(f"args: {args}")
-
-    sft_config = SFTConfig()
-
+def main(cfg):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    m = load_model(args.init, device)  # 加载模型
+    m = load_model(cfg.run.init, device)  # 加载模型
     log(f"vocab_size: {m.config.vocab_size}")
     # 配置 sft 训练参数
-    train_config = TrainConfig(
-        max_lr=3e-4,
-        min_lr=3e-5,
-        warmup_steps=50,
-        max_steps=args.max_steps,
-        eval_interval=100,
-        log_interval=10,
-        optimizer=args.optimizer
-    )
-    optimizer = configure_optimizer(m, train_config, args.optimizer)  # 加载优化器
+    optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer)  # 加载优化器
     train, test = split_pairs(SEED, N_TEST)  # 取 pairs
 
     # 训练
-    losses, norms = train_sft(m, optimizer, train_config, device, train, test, sft_config.B, SEED)
+    losses, norms = train_sft(m, optimizer, cfg.train, device, train, test, cfg.sft.B, cfg.train.seed)
     
     # 保存
-    save_path = args.out
+    save_path = cfg.run.out
     checkpoint = {
         "model": m.state_dict(),
         "model_config": asdict(m.config),
+        "config": asdict(cfg),
     }
     tmp_path = save_path + ".tmp"
     torch.save(checkpoint, tmp_path)
     os.replace(tmp_path, save_path)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--set", action="append", default=[])
+    args = parser.parse_args()
+    cfg = load_config(args.config, SFTExperiment, args.set)
+    setup_log(cfg.run.log)
+    log(f"args: {args}")
+    log(f"config:\n{json.dumps(asdict(cfg), indent=2)}")
+
+    main(cfg)

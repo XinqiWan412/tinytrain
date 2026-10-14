@@ -1,3 +1,5 @@
+from dataclasses import asdict
+import json
 import torch
 import numpy as np
 import model, dataloader
@@ -6,7 +8,7 @@ import argparse
 from logger import log, setup_log
 from muon import MuonWithAdamW
 from trainer import Trainer
-from config import TrainConfig, DataConfig
+from config import PretrainExperiment, TrainConfig, DataConfig, load_config
 
 
 class PretrainTask:
@@ -51,9 +53,10 @@ def train(model: model.ModelForCausalLM,
         data_config: DataConfig,
         optimizer_name,
         ckpt_dir,
-        start_step=0):
+        start_step=0,
+        config=None):
     task = PretrainTask(model, loader, val_loader, data_config)
-    trainer = Trainer(model, optimizer, train_config, task, ckpt_dir=ckpt_dir, optimizer_name=optimizer_name)
+    trainer = Trainer(model, optimizer, train_config, task, ckpt_dir=ckpt_dir, optimizer_name=optimizer_name, config=config)
     records = trainer.fit(start_step)
     return records["loss"], records["norm"]
 
@@ -131,47 +134,40 @@ def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
     return start_step
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--log", default="logs/pretrain.log")
-    parser.add_argument("--max_steps", type=int, default=None)
-    parser.add_argument("--eval_interval", type=int, default=None)
-    parser.add_argument("--resume", action="store_true")
-    parser.add_argument("--optimizer", default="adamw", choices=["adamw", "muon"])
-    parser.add_argument("--ckpt_dir", default="checkpoints")
-    args = parser.parse_args()
-
-    # 写 log 的准备
-    setup_log(args.log)
-    log(f"args:{args}")
-
+def main(cfg, resume):
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    train_config = TrainConfig()
-    data_config = DataConfig()
-    if args.max_steps is not None:
-        train_config.max_steps = args.max_steps
-    if args.eval_interval is not None:
-        train_config.eval_interval = args.eval_interval
-    train_config.optimizer = args.optimizer
-    torch.manual_seed(train_config.seed)
-    np.random.seed(train_config.seed)
-    data_dir = data_config.data_dir
+    torch.manual_seed(cfg.train.seed)
+    np.random.seed(cfg.train.seed)
+    data_dir = cfg.data.data_dir
 
-    config = model.ModelConfig()
-
-    m = model.ModelForCausalLM(config)
+    m = model.ModelForCausalLM(cfg.model)
     m.to(device)
-    optimizer = configure_optimizer(m, train_config, args.optimizer)
+    optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer)
 
-    B, T = data_config.B, data_config.T
+    B, T = cfg.data.B, cfg.data.T
     loader = dataloader.DataLoader(data_dir, 'train', B, T, device)
     val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device)
-    if args.resume:
+    start_step = 0
+    if resume:
         # 断点续训，读取训练中断前的模型、优化器、train loader 的 state_dict
-        path = os.path.join(args.ckpt_dir, "latest.pt")
-        start_step = load_checkpoint(path, m, optimizer, args.optimizer, loader, device)
-        # 开始训练
-        train(m, optimizer, loader, val_loader, train_config, data_config, args.optimizer, args.ckpt_dir, start_step=start_step)
-    else:
-        # 从头开始的训练走这里            
-        train(m, optimizer, loader, val_loader, train_config, data_config, args.optimizer, args.ckpt_dir)
+        path = os.path.join(cfg.run.ckpt_dir, "latest.pt")
+        start_step = load_checkpoint(path, m, optimizer, cfg.train.optimizer, loader, device)
+    # 开始训练
+    train(m, optimizer, loader, val_loader, cfg.train, cfg.data, cfg.train.optimizer, cfg.run.ckpt_dir, start_step=start_step, config=cfg)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--set", action="append", default=[])
+    parser.add_argument("--resume", action="store_true")
+    args = parser.parse_args()
+
+    cfg = load_config(args.config, PretrainExperiment, args.set)
+    
+    # 写 log 的准备
+    setup_log(cfg.run.log)
+    log(f"args:{args}")
+    log(f"config:\n{json.dumps(asdict(cfg), indent=2)}")
+
+    main(cfg, args.resume)

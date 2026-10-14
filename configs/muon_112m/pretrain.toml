@@ -1,0 +1,6 @@
+[train]
+optimizer = "muon"
+
+[run]
+ckpt_dir = "checkpoints/muon_112m"
+log = "logs/muon_112m/pretrain.log"
