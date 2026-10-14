@@ -8,7 +8,7 @@
 
 ### 1.12 亿参数全流程：AdamW vs Muon
 
-参数量 112,482,048。两条路线的数据、步数、lr 和调度完全相同，唯一的区别是优化器（`--optimizer`）。Muon 路线的 SFT 和 GRPO 也用 Muon。
+参数量 112,482,048。两条路线的数据、步数、lr 和调度完全相同，唯一的区别是优化器（`train.optimizer`）。Muon 路线的 SFT 和 GRPO 也用 Muon。
 
 
 | 阶段   | 指标                  | AdamW          | Muon           |
@@ -54,8 +54,9 @@
 ## 实现要点
 
 - 模型结构：配置为 hidden 768、12 层、8 头 / 2 KV 头（head_dim 128）、FFN 2304，共 1.12 亿参数（v0.2 为 hidden 256、4 层、FFN 768，1150 万参数）
-- 训练配置：AdamW（betas 0.9/0.95，weight decay 0.1 只加在 2 维参数上）或 Muon + AdamW（--optimizer muon），warmup + 余弦衰减，梯度裁剪 1.0，梯度累积，bf16 autocast
+- 训练配置：AdamW（betas 0.9/0.95，weight decay 0.1 只加在 2 维参数上）或 Muon + AdamW（train.optimizer=muon），warmup + 余弦衰减，梯度裁剪 1.0，梯度累积，bf16 autocast
 - 训练骨架：三个阶段共用 trainer.py 的 Trainer，它负责每步的公共流程（清梯度 → 逐份算 loss 并 backward → 梯度裁剪 → 设 lr → step → 记录、日志、eval、checkpoint）。各阶段写一个小类（PretrainTask、SFTTask、GRPOTask），用同名方法提供各自不同的部分：get_parts（这一步的数据分成几份，以及 rollout 奖励这类额外数字）、loss（每份缩放好的 loss）、evaluate（val loss 或准确率），预训练另有 state_dict（DataLoader 位置）。每份 loss 怎么缩放、autocast 包在哪里由阶段决定，Trainer 只负责让各份梯度相加
+- 配置：config.py 里的 dataclass（DataConfig、TrainConfig、SFTConfig、GRPOConfig、RunConfig；ModelConfig 在 model.py）规定字段、类型和默认值，每个脚本有一个顶层配置类，规定它有哪几节；load_config 用 tomllib 读 TOML 配置文件，文件只写和默认值不同的字段，不认识的节或键、类型对不上都直接报错；命令行的 --set 节.键=值 先合并进来再一起检查；读完的完整配置（含默认值）打进日志开头，并存进 checkpoint 的 config 键
 - SFT：只对答案和 `<|im_end|>` 算 loss
 - GRPO：每题采样 8 次，组内标准化算优势，loss 加对冻结参考模型的 KL 惩罚（k3 估计）
 - GRPO 分块梯度累积：1.12 亿参数时，每步 512 条序列一次前向放不下。compute_loss 把它们分块（`--chunk_size`，默认 128），每块单独做参考模型前向、策略模型前向和 backward，梯度在 .grad 里累加；每块的 loss 和 KL 对块内各行求和后除以总行数，各块梯度之和与不分块时一致（v0.2 小模型上 1 块和 4 块的梯度范数 2.219704 vs 2.219820；现在由 tests/test_grpo.py 的分块一致性测试覆盖）
@@ -78,12 +79,12 @@
 - `train_tokenizer.py`：训练自己的 BPE 分词器，结果存为 tokenizer_32k.json
 - `tokenizer.py`：加载了特殊 token 的分词器 enc，以及两个输入 str、返回 token_ids(list[int])的 render 函数
 - `model.py`：实现模型结构，内含 load_model 函数、ModelConfig
-- `pretrain.py`：预训练，内含 TrainConfig、configure_optimizer、PretrainTask（每步取 grad_accum 份数据、提供 DataLoader 状态给 checkpoint）、train（薄外壳，返回每步 loss 和梯度范数）、load_checkpoint，支持 --log、--max_steps、--eval_interval、--resume、--optimizer、--ckpt_dir
+- `pretrain.py`：预训练，内含 main、configure_optimizer、PretrainTask（每步取 grad_accum 份数据、提供 DataLoader 状态给 checkpoint）、train（薄外壳，返回每步 loss 和梯度范数）、load_checkpoint，支持 --config、--set、--resume
 - `sft_data.py`：提供一些处理 question、prompt、answer 的函数，以及 SEED、N_TEST 参数
-- `sft.py`：SFT，内含数据加载器 SFTLoader、SFTTask 和 train_sft（薄外壳，返回每步 loss 和梯度范数），支持 --init、--out、--log、--max_steps、--optimizer
+- `sft.py`：SFT，内含数据加载器 SFTLoader、SFTTask、train_sft（薄外壳，返回每步 loss 和梯度范数）和 main，支持 --config、--set、--resume
 - `eval_sft.py`：提供 evaluate_accuracy 函数，用贪心采样，对测试集计算准确率
 - `generate.py`：提供 generate 函数，简易的批量推理
-- `grpo.py`：GRPO，内含 rollout、build_rows（拼行补齐）、chunk_loss（算一块的 loss 和 KL）、compute_loss（分块算 loss 并 backward，供测试使用）、GRPOTask 和 train_grpo（薄外壳，返回每步 loss、KL、梯度范数、平均奖励和有对有错的比例），支持 --init、--out、--log、--max_steps、--chunk_size、--optimizer
+- `grpo.py`：GRPO，内含 rollout、build_rows（拼行补齐）、chunk_loss（算一块的 loss 和 KL）、compute_loss（分块算 loss 并 backward，供测试使用）、GRPOTask 和 train_grpo（薄外壳）和 main，支持 --config、--set、--resume
 - `trainer.py`：通用训练骨架。get_lr、set_lr 两个小函数，以及 Trainer 类（清梯度、逐份 backward、梯度裁剪、lr 调度、记录、日志、按间隔 eval、可选的 checkpoint 保存和 tok/s）
 - `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件
 - `muon.py`：newton_schulz 正交化函数和 MuonWithAdamW 优化器类（一个优化器内按参数组分别做 Muon 和 AdamW 更新）
@@ -98,6 +99,9 @@
   - `test_muon.py`：newton_schulz 正交化后的奇异值范围；MuonWithAdamW 的 AdamW 分支与 torch.optim.AdamW 逐步对拍
   - `test_sft.py`：16 道题、B=4 在 CPU 上跑 train_sft 10 步（过程中换轮打乱两次），AdamW / Muon 基线
   - `test_grpo.py`：compute_loss 分块与不分块的 loss、KL、梯度一致；先 SFT 200 步把小模型训到采样时有对有错，再跑 4 步 train_grpo，AdamW / Muon 基线，并断言出现过有对有错的题
+  - `test_config.py`：正常读取、拼错键和节名报错、类型不对报错、--set 覆盖生效，以及 configs/ 下所有文件都能读通
+- `config.py`：配置类（DataConfig、TrainConfig、SFTConfig、GRPOConfig、RunConfig，以及三个脚本各自的顶层配置类），load_config 读 TOML 并支持 --set 覆盖
+- `configs/`：adamw_112m、muon_112m 两条路线，每条 4 个配置文件（pretrain、sft、sft_weak、grpo），对应 v0.3 的 8 次运行
 
 
 ## 复现
@@ -112,7 +116,7 @@
 
 ### 测试
 
-`pytest -v`：跑快测试（31 个，约 14 秒，不需要数据）
+`pytest -v`：跑快测试（36 个，约 16 秒，不需要数据）
 `pytest -m slow -v`：跑慢测试（2 个，需要第 1 步下载的原始数据）
 
 训练循环的测试用假数据和小模型在 CPU 上以 fp32 运行，同一台机器上结果逐位可复现。基线记录的是当前代码每步的 loss 和梯度范数（相对误差 1e-5），只能说明行为没变，不能说明行为正确，所以另有 overfit 测试检查能否学会。有意改变训练行为时（如改 lr 调度）才重录基线，并在提交说明里写明。CPU 测试不覆盖 bf16 autocast 和训练速度。
@@ -120,6 +124,8 @@
 SFT 和 GRPO 的基线用真分词器和小模型在 CPU 上跑，GRPO 另外记录每步的 KL 和平均奖励。GRPO 基线要求采样时有对有错：如果全对或全错，组内优势全为 0，策略梯度不起作用，基线就测不到它。临时把 compute_loss 里的优势取反时，GRPO 基线会失败而分块测试不受影响。
 
 ### 步骤
+
+每次运行的参数都写在 configs/ 下的配置文件里，脚本只用 --config 指定。临时改参数用 --set 节.键=值（可写多次），比如 --set train.max_steps=250。完整配置会打在日志开头，也会存进 checkpoint。
 
 **1. 下载数据**：fineweb-edu sample-10BT 的前三个分片
 
@@ -136,49 +142,44 @@ hf download HuggingFaceFW/fineweb-edu --repo-type dataset \
 - 输入：`data/raw/fineweb-edu/sample/10BT/` 下的所有 parquet（000～002）
 - 输出：`data/tokenized/bpe32k/` 下的 `val_000000.bin`（约 1000 万 token）、`train_000000~000022.bin`（每片约 1 亿 token）、`meta.json`，共约 22.9 亿 token；切完自动运行 check_all 校验
 
-**3. 预训练**：`python pretrain.py --log logs/pretrain.log`
+**3. 预训练**：
+`python pretrain.py --config configs/adamw_112m/pretrain.toml`
 
 - 输入：上一步的 .bin 分片
 - 输出：`checkpoints/final.pt`
 - 1.12 亿参数，34,000 步，每步 65,536 token（B=16、T=512、累积 8 次），约 1.34 s/步，共约 13 小时
 - 预期：val loss 约 3.15
-- 长跑建议放在 tmux 里。日志追加写进 --log 指定的文件，可用 `tail -f` 实时查看；中断后在原命令后加 `--resume`，会从 `checkpoints/latest.pt`（每 250 步存一次）接着训练
-- 训完把 checkpoint 挪进这条路线的目录，后面几步都从这里读：
-
-```bash
-mkdir -p checkpoints/adamw_112m
-mv checkpoints/final.pt checkpoints/latest.pt checkpoints/adamw_112m/
-```
+- 长跑建议放在 tmux 里。日志追加写进 run.log 指定的文件（logs/adamw_112m/pretrain.log），可用 `tail -f` 实时查看；中断后在原命令后加 `--resume`，会从 `checkpoints/adamw_112m/latest.pt`（每 250 步存一次）接着训练
 
 **4. SFT**：
-`python sft.py --init checkpoints/adamw_112m/final.pt --out checkpoints/adamw_112m/sft.pt --log logs/sft.log`
+`python sft.py --config configs/adamw_112m/sft.toml`
 
 - 题目由 sft_data.py 按 SEED=400 生成，不需要额外数据
 - 2000 步，B=128，lr 3e-4（warmup 50 步）余弦降到 3e-5
 - 评估：`python eval_sft.py --ckpt checkpoints/adamw_112m/sft.pt`，预期贪心准确率 100%（500 道测试题全对）
 
 **5. 弱 SFT（GRPO 的起点）**：
-`python sft.py --init checkpoints/adamw_112m/final.pt --max_steps 57 --out checkpoints/adamw_112m/sft_weak.pt --log logs/sft_weak.log`
+`python sft.py --config configs/adamw_112m/sft_weak.toml`
 
 - 预期：`python eval_sft.py --ckpt checkpoints/adamw_112m/sft_weak.pt` 测得约 40.0%
 - 1.12 亿参数模型 SFT 学得更快，准确率在 50～80 步之间涨得很陡（50 步 23.6%，55 步 28.8%，60 步 43.0%，80 步 80.4%）；选 57 步让起点接近 v0.2 的 37.4%，方便对比 GRPO 的效果。因为这一段很陡，复现时起点准确率可能和 40.0% 有几个点的出入
 
 **6. GRPO**：
-`python grpo.py --init checkpoints/adamw_112m/sft_weak.pt --out checkpoints/adamw_112m/grpo_kl02.pt --log logs/grpo.log`
+`python grpo.py --config configs/adamw_112m/grpo.toml`
 
-- 策略模型和参考模型都从 --init 读
+- 策略模型和参考模型都从 run.init 读
 - 500 步，每 50 步打印一次测试集贪心准确率
-- 显存：每步要对 512 条序列做前向和反向，默认按 128 条一块做梯度累积；爆显存可以改小，如 `--chunk_size 64`，梯度和不分块时一致
+- 显存：每步要对 512 条序列做前向和反向，默认按 128 条一块做梯度累积；爆显存可以改小，如 `--set grpo.chunk_size=64`，梯度和不分块时一致
 - 预期：结尾准确率 94.2%，10 次评估平均 82.2%
 - 对比 v0.2（相对各自起点的变化，单位为百分点；起点分别为 37.4% 和 40.0%）：结尾准确率 +32.0 → +54.2，10 次评估平均 +22.1 → +42.2。训练过程中没有出现 v0.2 前 50 步先掉的现象；结尾训练采样奖励约 0.8（v0.2 约 0.40），KL 约 0.2～0.5（v0.2 约 0.11）
 
-**7. Muon 路线**：数据和第 1～2 步相同，各步命令加 `--optimizer muon`，输出放 `checkpoints/muon_112m/`
+**7. Muon 路线**：数据和第 1～2 步相同，使用 configs/muon_112m/ 下的配置文件
 
 ```bash
-python pretrain.py --optimizer muon --ckpt_dir checkpoints/muon_112m --log logs/pretrain_muon.log
-python sft.py --init checkpoints/muon_112m/final.pt --out checkpoints/muon_112m/sft.pt --optimizer muon --log logs/sft_muon.log
-python sft.py --init checkpoints/muon_112m/final.pt --max_steps 75 --out checkpoints/muon_112m/sft_weak.pt --optimizer muon --log logs/sft_weak_muon.log
-python grpo.py --init checkpoints/muon_112m/sft_weak.pt --out checkpoints/muon_112m/grpo_kl02.pt --optimizer muon --log logs/grpo_muon.log
+python pretrain.py --config configs/muon_112m/pretrain.toml
+python sft.py --config configs/muon_112m/sft.toml
+python sft.py --config configs/muon_112m/sft_weak.toml
+python grpo.py --config configs/muon_112m/grpo.toml
 ```
 
 - 预期：预训练 val loss 约 3.107，SFT 100%，弱起点约 40.8%，GRPO 结尾 84.6%、10 次评估平均 71.5%
@@ -193,7 +194,7 @@ python grpo.py --init checkpoints/muon_112m/sft_weak.pt --out checkpoints/muon_1
 1. 训练框架化（多卡并行要改训练循环，先把循环统一起来再做会容易得多）
   - 已完成：把 pretrain.py、sft.py、grpo.py 里重复的训练循环（梯度累积、lr 调度、梯度裁剪、日志、checkpoint）抽成统一的 Trainer，各阶段只提供数据和 loss
   - 已完成：把 Muon 和 AdamW 合并成一个优化器 MuonWithAdamW，configure_optimizer 返回单个对象
-  - 实验参数改用配置文件描述
+  - 已完成：实验参数改用配置文件描述
 2. 导出 HF 格式对拍：参数名已与 HF Qwen3 对齐，导出 config.json + safetensors，用 transformers 加载后比较同一输入的 logits，验证模型实现
 3. 多卡并行：上云租 4 卡 5090，依次实现 DDP、ZeRO / FSDP、TP、PP
 4. 性能优化
