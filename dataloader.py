@@ -5,7 +5,7 @@ import tiktoken
 
 
 class DataLoader:
-    def __init__(self, data_dir, split, B, T, device):
+    def __init__(self, data_dir, split, B, T, device, rank=0, world_size=1):
         assert split in ("train", "val")
         self.data_dir = data_dir
         self.split = split  # 'train'或者'val'
@@ -13,6 +13,9 @@ class DataLoader:
         self.T = T  # seq_len
         self.device = device
         self.shard_tokens = {}
+        self.rank = rank
+        self.world_size = world_size
+        assert 0 <= rank < world_size
         meta_path = os.path.join(self.data_dir, "meta.json")
         with open(meta_path, "r") as fp:
             meta = json.load(fp)
@@ -49,13 +52,14 @@ class DataLoader:
     def next_batch(self):
         # 返回 x, y
         B, T = self.B, self.T
-        if self.pos + B*T+1 > len(self.tokens):
-            # 如果这个 shard 的剩余部分不够 B*T 了，就切换到下一片
+        if self.pos + self.world_size*B*T + 1 > len(self.tokens):
+            # 如果这个 shard 的剩余部分不够这一组进程读了，就切换到下一片
             self.shard_idx = (self.shard_idx + 1) % len(self.shards)
             self.pos = 0
             self._load_shard()
 
-        data = self.tokens[self.pos:self.pos + B*T+1]  # 抽出B*T+1个token
+        start = self.pos + self.rank * B * T
+        data = self.tokens[start:start + B*T+1]  # 抽出B*T+1个token，+1 是因为 y 是 x 的下一个 token，要错位
         x, y = data[:B*T], data[1:]
         x = x.reshape(B, T).astype(np.int64)
         x = torch.from_numpy(x)
@@ -63,7 +67,7 @@ class DataLoader:
         y = y.reshape(B, T).astype(np.int64)
         y = torch.from_numpy(y)
         y = y.to(self.device)        
-        self.pos += B*T
+        self.pos += self.world_size*B*T
 
         return x, y  # 已经做了格式转换、搬到 device 上
     
