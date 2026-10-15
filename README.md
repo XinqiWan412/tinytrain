@@ -29,6 +29,23 @@
 
 
 
+### 与 HF transformers 对拍
+
+导出后用 transformers 的 Qwen3ForCausalLM 读回，fp32、CPU 上比较。
+
+| 模型        | logits 最大差 | 一段英文上的 loss（自己 / HF） | 测试集前 8 题贪心生成 |
+| --------- | ---------- | ------------------ | ------------- |
+| AdamW 预训练 | 1.9e-5     | 2.3082 / 2.3082    | —             |
+| Muon 预训练  | 1.7e-5     | 2.1467 / 2.1467    | —             |
+| AdamW SFT | 2.1e-5     | 11.9223 / 11.9223  | 8/8 一致，8/8 答对 |
+| Muon SFT  | 2.8e-5     | 11.1828 / 11.1828  | 8/8 一致，8/8 答对 |
+
+- HF 生成时走 KV cache，generate.py 每步从头重算，两者生成的 token 完全相同
+- 小模型测试里故意改错来验证对拍有效：GQA 的 repeat_interleave 换成 repeat，logits 最大差 0.862；QK-norm 挪到 RoPE 之后，最大差 0.164（norm 权重不随机化时测不出）
+- SFT 模型在普通英文上的 loss 高于均匀分布的 ln 32768 ≈ 10.4，是只练加法 2000 步造成的遗忘，两边一致，与导出无关
+
+
+
 ### 1150 万参数全流程（v0.2）
 
 这一版用于验证整个 pipeline 的正确性，数字用于说明各阶段跑通，不是为了说明模型效果好。复现这一版请先 `git checkout v0.2`。
@@ -61,6 +78,7 @@
 - GRPO：每题采样 8 次，组内标准化算优势，loss 加对冻结参考模型的 KL 惩罚（k3 估计）
 - GRPO 分块梯度累积：1.12 亿参数时，每步 512 条序列一次前向放不下。compute_loss 把它们分块（`--chunk_size`，默认 128），每块单独做参考模型前向、策略模型前向和 backward，梯度在 .grad 里累加；每块的 loss 和 KL 对块内各行求和后除以总行数，各块梯度之和与不分块时一致（v0.2 小模型上 1 块和 4 块的梯度范数 2.219704 vs 2.219820；现在由 tests/test_grpo.py 的分块一致性测试覆盖）
 - 批量生成按 prompt 长度分组（eval_sft.py 和 grpo.py 的 rollout）：数字逐位切分后，prompt 长度随两个加数的位数变化，而同一批生成要求 prompt 等长
+- 导出 HF 格式（export_hf.py）：参数名与 HF Qwen3 对齐，ModelConfig 逐项转成 Qwen3Config（max_seq_len 对应 max_position_embeddings；rope_theta 按 transformers 5.x 写进 rope_parameters；tie_word_embeddings 必须显式写 true，Qwen3Config 默认是 false）。权重存成 safetensors，embedding 与 lm_head 共享时只存 embed_tokens，加载时由 transformers 绑回。导出后用 transformers 以 fp32 读回，确认没有漏读或多余的权重，再比较同一输入的 logits；输入不带 padding，生成对比逐题单条进行。这种对拍能查出"自己和自己比"的测试查不出的约定错误，比如 GQA 里 KV 头怎么对应到 Q 头、QK-norm 放在 RoPE 前还是后：写错了形状不变、照样能训练，基线也会照着错的结果录下来。小模型测试要先把 norm 权重随机化，因为权重全为 1 时 norm 和 RoPE 可以交换顺序，QK-norm 放错位置测不出来
 - 对话格式：与 Qwen3 一致
 
 ```
@@ -84,6 +102,7 @@
 - `sft.py`：SFT，内含数据加载器 SFTLoader、SFTTask、train_sft（薄外壳，返回每步 loss 和梯度范数）和 main，支持 --config、--set、--resume
 - `eval_sft.py`：提供 evaluate_accuracy 函数，用贪心采样，对测试集计算准确率
 - `generate.py`：提供 generate 函数，简易的批量推理
+- `export_hf.py`：把 checkpoint 导出成 Hugging Face 格式（config.json + model.safetensors，transformers 可按 Qwen3ForCausalLM 直接加载），导出后自动读回对拍 logits 最大差和一段文本上的 loss；加 --gen 时再比较测试题上的贪心生成，支持 --ckpt、--out、--gen
 - `grpo.py`：GRPO，内含 rollout、build_rows（拼行补齐）、chunk_loss（算一块的 loss 和 KL）、compute_loss（分块算 loss 并 backward，供测试使用）、GRPOTask 和 train_grpo（薄外壳）和 main，支持 --config、--set、--resume
 - `trainer.py`：通用训练骨架。get_lr、set_lr 两个小函数，以及 Trainer 类（清梯度、逐份 backward、梯度裁剪、lr 调度、记录、日志、按间隔 eval、可选的 checkpoint 保存和 tok/s）
 - `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件
@@ -100,6 +119,7 @@
   - `test_sft.py`：16 道题、B=4 在 CPU 上跑 train_sft 10 步（过程中换轮打乱两次），AdamW / Muon 基线
   - `test_grpo.py`：compute_loss 分块与不分块的 loss、KL、梯度一致；先 SFT 200 步把小模型训到采样时有对有错，再跑 4 步 train_grpo，AdamW / Muon 基线，并断言出现过有对有错的题
   - `test_config.py`：正常读取、拼错键和节名报错、类型不对报错、--set 覆盖生效，以及 configs/ 下所有文件都能读通
+  - `test_export_hf.py`：把 norm 权重随机化后的小模型导出，用 transformers 以 fp32 读回，检查没有漏读或多余的权重、logits 一致；没装 transformers 时自动跳过
 - `config.py`：配置类（DataConfig、TrainConfig、SFTConfig、GRPOConfig、RunConfig，以及三个脚本各自的顶层配置类），load_config 读 TOML 并支持 --set 覆盖
 - `configs/`：adamw_112m、muon_112m 两条路线，每条 4 个配置文件（pretrain、sft、sft_weak、grpo），对应 v0.3 的 8 次运行
 
@@ -111,12 +131,12 @@
 
 - GPU：单张 RTX 4070 Ti Super 16GB，全程 bf16 autocast
 - Python 3.12.14，PyTorch 2.14.0+cu130，CUDA 13.0
-- 其他依赖：tiktoken 0.14.0、numpy 2.5.2、pyarrow 25.0.1, pytest 9.1.1
+- 其他依赖：tiktoken 0.14.0、numpy 2.5.2、pyarrow 25.0.1、pytest 9.1.1；导出 HF 格式另需 transformers 5.19.0、safetensors 0.8.0
 
 
 ### 测试
 
-`pytest -v`：跑快测试（36 个，约 16 秒，不需要数据）
+`pytest -v`：跑快测试（37 个，约 16 秒，不需要数据）
 `pytest -m slow -v`：跑慢测试（2 个，需要第 1 步下载的原始数据）
 
 训练循环的测试用假数据和小模型在 CPU 上以 fp32 运行，同一台机器上结果逐位可复现。基线记录的是当前代码每步的 loss 和梯度范数（相对误差 1e-5），只能说明行为没变，不能说明行为正确，所以另有 overfit 测试检查能否学会。有意改变训练行为时（如改 lr 调度）才重录基线，并在提交说明里写明。CPU 测试不覆盖 bf16 autocast 和训练速度。
@@ -185,6 +205,19 @@ python grpo.py --config configs/muon_112m/grpo.toml
 - 预期：预训练 val loss 约 3.107，SFT 100%，弱起点约 40.8%，GRPO 结尾 84.6%、10 次评估平均 71.5%
 - 中断后在预训练命令后加 `--resume`，会从 `checkpoints/muon_112m/latest.pt` 接着训练；优化器名和 checkpoint 里记录的不一致会直接报错
 
+**8. 导出 HF 格式并对拍**：
+
+```bash
+python export_hf.py --ckpt checkpoints/adamw_112m/final.pt --out hf/adamw_112m/pretrain
+python export_hf.py --ckpt checkpoints/adamw_112m/sft.pt --out hf/adamw_112m/sft --gen
+```
+
+- 输出目录里是 config.json 和 model.safetensors（fp32，约 430 MB），可用 `AutoModelForCausalLM.from_pretrained` 直接加载；hf/ 已加进 .gitignore
+- 导出后自动读回，打印 logits 最大差和一段固定英文上两边的 loss；加 --gen 再对测试集前 8 题比较贪心生成，只用于 SFT / GRPO 模型（预训练模型没学过对话格式）
+- 只导出模型，不导出分词器，config 里也没有设 eos
+- 预期：logits 最大差约 2e-5，两边 loss 相同，SFT 生成 8/8 一致、8/8 答对
+- Muon 路线把路径里的 adamw_112m 换成 muon_112m
+
 
 
 ## 下一步
@@ -195,7 +228,7 @@ python grpo.py --config configs/muon_112m/grpo.toml
   - 已完成：把 pretrain.py、sft.py、grpo.py 里重复的训练循环（梯度累积、lr 调度、梯度裁剪、日志、checkpoint）抽成统一的 Trainer，各阶段只提供数据和 loss
   - 已完成：把 Muon 和 AdamW 合并成一个优化器 MuonWithAdamW，configure_optimizer 返回单个对象
   - 已完成：实验参数改用配置文件描述
-2. 导出 HF 格式对拍：参数名已与 HF Qwen3 对齐，导出 config.json + safetensors，用 transformers 加载后比较同一输入的 logits，验证模型实现
+2. 导出 HF 格式对拍（已完成）：导出 config.json + safetensors，用 transformers 加载后比较 logits 和贪心生成，验证模型实现
 3. 多卡并行：上云租 4 卡 5090，依次实现 DDP、ZeRO / FSDP、TP、PP
 4. 性能优化
   - 先测 MFU，用 torch.profiler 定位瓶颈
@@ -208,6 +241,7 @@ python grpo.py --config configs/muon_112m/grpo.toml
 ### 之后：推理框架
 
 - 实现 KV cache、批量调度等，接入 GRPO 的 rollout，并与 vLLM 对照
+- 接 vLLM 前，先把分词器导出成 HF 的 tokenizer.json，并在 config 里设好 eos
 
 
 
