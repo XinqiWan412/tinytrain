@@ -9,6 +9,8 @@ from logger import log, setup_log
 from muon import MuonWithAdamW
 from trainer import Trainer
 from config import PretrainExperiment, TrainConfig, DataConfig, load_config
+from torch.nn.parallel import DistributedDataParallel as DDP
+from parallel.dist_utils import setup, cleanup, get_rank, get_world_size, all_reduce_mean
 
 
 class PretrainTask:
@@ -19,9 +21,10 @@ class PretrainTask:
         self.data_config = data_config
         B, T = self.loader.B, self.loader.T
         global_batch_size = self.data_config.global_batch_size
-        assert global_batch_size % (B*T) == 0
-        self.grad_accum_steps = global_batch_size // (B*T)
-        self.tokens_per_step = B*T*self.grad_accum_steps
+        W = self.loader.world_size
+        assert global_batch_size % (B*T*W) == 0
+        self.grad_accum_steps = global_batch_size // (B*T*W)
+        self.tokens_per_step = B*T*self.grad_accum_steps*W
 
     def get_parts(self, step):
         res = []
@@ -110,15 +113,19 @@ def evaluate(model, val_loader: dataloader.DataLoader, data_config: DataConfig):
     model.eval()
     val_loader.reset()
     eval_steps = data_config.eval_steps
+    W = val_loader.world_size
+    assert eval_steps % W == 0, f"eval_steps % world_size = {eval_steps % W}, expected 0"
     loss_accum = 0.0
-    for step in range(eval_steps):
+    per_rank_eval_steps = eval_steps // W
+    for step in range(per_rank_eval_steps):
         x, y = val_loader.next_batch()
         with torch.no_grad():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
                 _, loss = model(x, y)
         loss_accum += loss.detach()
-    loss_avg = loss_accum / eval_steps
+    loss_avg = loss_accum / per_rank_eval_steps
     model.train()
+    loss_avg = all_reduce_mean(loss_avg)
     return loss_avg.item()
 
 
@@ -134,8 +141,8 @@ def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
     return start_step
 
 
-def main(cfg, resume):
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+def main(cfg, resume, device):
+    rank, world_size = get_rank(), get_world_size()
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
     data_dir = cfg.data.data_dir
@@ -145,13 +152,15 @@ def main(cfg, resume):
     optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer)
 
     B, T = cfg.data.B, cfg.data.T
-    loader = dataloader.DataLoader(data_dir, 'train', B, T, device)
-    val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device)
+    loader = dataloader.DataLoader(data_dir, 'train', B, T, device, rank=rank, world_size=world_size)
+    val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device, rank=rank, world_size=world_size)
     start_step = 0
     if resume:
         # 断点续训，读取训练中断前的模型、优化器、train loader 的 state_dict
         path = os.path.join(cfg.run.ckpt_dir, "latest.pt")
         start_step = load_checkpoint(path, m, optimizer, cfg.train.optimizer, loader, device)
+    if world_size > 1:
+        m = DDP(m, forward_sync_buffers=False)
     # 开始训练
     train(m, optimizer, loader, val_loader, cfg.train, cfg.data, cfg.train.optimizer, cfg.run.ckpt_dir, start_step=start_step, config=cfg)
 
@@ -166,8 +175,10 @@ if __name__ == "__main__":
     cfg = load_config(args.config, PretrainExperiment, args.set)
     
     # 写 log 的准备
+    device = setup()
     setup_log(cfg.run.log)
     log(f"args:{args}")
     log(f"config:\n{json.dumps(asdict(cfg), indent=2)}")
 
-    main(cfg, args.resume)
+    main(cfg, args.resume, device)
+    cleanup()

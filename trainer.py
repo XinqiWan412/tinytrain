@@ -1,6 +1,8 @@
-import math, collections, torch, os, time
+import math, collections, torch, os, time, contextlib
 from logger import log
 from dataclasses import asdict
+from torch.nn.parallel import DistributedDataParallel as DDP
+from parallel.dist_utils import is_main, all_reduce_mean
 
 
 def get_lr(step, train_config):
@@ -35,6 +37,8 @@ class Trainer:
         self.tokens_per_step = getattr(self.task, "tokens_per_step", None)
         self.log_formats = getattr(self.task, "log_formats", {})
         self.config = config
+        self.is_ddp = isinstance(model, DDP)
+        self.raw_model = model.module if self.is_ddp else model
 
     def fit(self, start_step=0):
         records = collections.defaultdict(list)  # 记录返回值
@@ -50,13 +54,20 @@ class Trainer:
             loss_accum = 0.0
             part_extra_acc = {}
             # 前向反向
-            for part in parts:
-                loss, part_extra = self.task.loss(part)
-                loss.backward()
+            for i, part in enumerate(parts):
+                # 只在最后一个 part 做梯度 all-reduce
+                if self.is_ddp and i < len(parts) - 1:
+                    sync_ctx = self.model.no_sync()
+                else:
+                    sync_ctx = contextlib.nullcontext()
+                with sync_ctx:
+                    loss, part_extra = self.task.loss(part)
+                    loss.backward()
                 loss_accum += loss.detach()
                 # 存额外参数，如 GRPO 的 kl
                 for k, v in part_extra.items():
                     part_extra_acc[k] = part_extra_acc.get(k, 0.0) + v
+            loss_accum = all_reduce_mean(loss_accum)  # step_extra, part_extra 没有跨进程平均，目前只有预训练用 DDP，没有额外数字
             # 梯度裁剪
             norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
             # 设学习率
@@ -102,7 +113,7 @@ class Trainer:
         text = ", ".join(f"{k}:{v:.4f}" for k, v in metrics.items())
         # 打印 log
         log(f"step:{step}, {text}")
-        if self.ckpt_dir is not None:
+        if self.ckpt_dir is not None and is_main():
             # 存 checkpoint
             filename = "final.pt" if final else "latest.pt"
             self._save(os.path.join(self.ckpt_dir, filename), step, metrics)
@@ -112,8 +123,8 @@ class Trainer:
     def _save(self, path, step, metrics):
         checkpoint = {
             # 用模型需要的
-            "model": self.model.state_dict(),
-            "model_config": asdict(self.model.config),
+            "model": self.raw_model.state_dict(),
+            "model_config": asdict(self.raw_model.config),
             # 接着训需要的
             "optimizer": self.optimizer.state_dict(),
             "optimizer_name": self.optimizer_name,
