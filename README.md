@@ -1,7 +1,7 @@
 # tinytrain
 
 从零手写的 LLM 训练全流程：预训练 → SFT → GRPO。模型结构参考 Qwen3-0.6B，
-在单张 RTX 4070 Ti Super（16GB）上先用 1150 万参数的小模型跑通，再把全流程扩大到 1.12 亿参数。
+在单张 RTX 4070 Ti Super（16GB）上先用 1150 万参数的小模型跑通，再把全流程扩大到 1.12 亿参数。预训练支持 DDP 多卡，在 4×RTX 4090 上验证过。
 模型、数据加载、训练循环、对话模板、GRPO 都是自己实现的，没有用 transformers / trl。
 
 ## 结果
@@ -43,6 +43,25 @@
 - HF 生成时走 KV cache，generate.py 每步从头重算，两者生成的 token 完全相同
 - 小模型测试里故意改错来验证对拍有效：GQA 的 repeat_interleave 换成 repeat，logits 最大差 0.862；QK-norm 挪到 RoPE 之后，最大差 0.164（norm 权重不随机化时测不出）
 - SFT 模型在普通英文上的 loss 高于均匀分布的 ln 32768 ≈ 10.4，是只练加法 2000 步造成的遗忘，两边一致，与导出无关
+
+
+
+### DDP：单卡与四卡
+
+在 Runpod 上租一台 4×RTX 4090 的机器（卡间无 NVLink，也不支持 P2P），Muon 路线跑前 300 步。300 步全程在 warmup 内，学习率和 v0.3 那次完全相同。单卡用其中一张卡跑。
+
+|                 | 单卡             | 四卡（DDP）         |
+| --------------- | -------------- | --------------- |
+| 每步时间            | 816 ms         | 372 ms          |
+| 吞吐              | 约 8.02 万 tok/s | 约 17.6 万 tok/s |
+| 每张卡显存           | 10,726 MiB     | 11,304 MiB      |
+| 第 250 步 val loss | 6.3355         | 6.3356          |
+| 第 300 步 val loss | 6.0104         | 6.0104          |
+
+- 扩展效率：17.6 万 ÷（8.02 万 × 4）≈ 55%，4 张卡快了约 2.2 倍
+- 瓶颈是梯度通信：每步要在 4 张卡之间平均约 450 MB 的 fp32 梯度，这台机器卡间不支持 P2P，要经 CPU 内存中转。单独测一次 450 MB 的 all-reduce 要 175 ms（每张卡有效收发约 3.9 GB/s），而四卡每步比只算不传多出约 150 ms，多出的时间基本都是它。DDP 在最后一份反向时提前开始通信，只藏住了其中一小部分：每张卡只累积 2 份，计算太少，藏不住通信
+- loss：四卡与单卡相差万分之几；单卡与 v0.3（本地 4070 Ti Super）相差千分之几（第 250 步 val loss 6.3355 vs 6.3354），差别来自不同显卡上 bf16 计算的末位
+- 四卡每张卡比单卡多用 578 MiB 显存，是 DDP 做梯度通信用的缓冲区
 
 
 
@@ -88,38 +107,42 @@
 - 长时间训练：日志（logger.py，pretrain/sft/grpo 共用）在 print 的同时追加写进文件、每行 flush；断点续训保存模型、优化器、步数和 DataLoader 位置（DataLoader 提供 state_dict / load_state_dict），checkpoint 先写临时文件再用 os.replace 替换，写到一半被打断也不会损坏旧文件
 - 数据切分：一次处理目录下所有 parquet，分片编号跨文件连续；val 固定为第一个文件开头的 1000 万 token，增加数据后结果仍能和之前比较
 - Muon（muon.py）：动量（0.95，Nesterov）之后用 Newton-Schulz 迭代 5 次把动量矩阵近似正交化（只用矩阵乘，bf16），让各奇异方向的步长一致；更新系数用 Moonlight 的 0.2×√max(行, 列)，使更新幅度与 AdamW 对齐，lr、weight decay 和调度都直接沿用 AdamW；按参数形状分组：块内的 2 维矩阵（q/k/v/o 和 MLP 三个矩阵）用 Muon，embedding（与 lm_head 共享）和 1 维 norm 参数仍用 AdamW；两部分装在同一个优化器类 MuonWithAdamW 里：它继承 torch.optim.Optimizer，参数组用 use_muon 标记，step 时按组分别走 Muon 和 AdamW 的更新（AdamW 部分手写，运算顺序与 torch 的非 fused 实现一致，tests/test_muon.py 里与 torch.optim.AdamW 逐步对拍）；configure_optimizer 返回单个优化器，Trainer 直接调用它的 zero_grad / step
+- DDP（只用于预训练）：用 torchrun 启动时，rank、world_size 从环境变量读，GPU 用 nccl、CPU 用 gloo；直接用 python 启动时走原来的单进程路径，现有测试和基线不变。全局 batch 保持 65,536，每个进程的累积次数 = 全局 batch ÷（B×T×进程数），4 卡时每卡累积 2 次。数据按进程跳着读：DataLoader 的 pos 是所有进程共同的位置，读数据时再加上 rank×B×T 的偏移，每批前进 进程数×B×T，所有进程在同一步换片；state_dict 不用改，续训时各进程自动回到自己的位置。这样每一步各进程合起来读的正是单进程会读的那些 token，平均后的梯度和单进程相同，只差浮点加法顺序。梯度累积时最后一份之前用 no_sync 跳过同步（前向和反向一起包住）；日志里的 loss 和 val_loss 先跨进程平均；只有 0 号进程写日志、存 checkpoint，存的是包装前的模型，键不带 "module." 前缀，load_model、export_hf、sft.py 照常能读。正确性在本地用 gloo 起两个 CPU 进程验证：tests/test_ddp.py 用 subprocess 分别跑单进程和两进程，比较 final.pt；另测两进程中途续训与一口气跑完逐位相同。临时去掉 rank 偏移时，交替读取测试和等价测试失败；load_state_dict 里重复加偏移时，只有续训测试失败
 
 
 ## 项目结构
 
 - `prepare_data.py`：把目录下所有 .parquet 切成 .bin 分片，内含 check_all 校验
-- `dataloader.py`：用于预训练阶段的数据加载器
+- `dataloader.py`：用于预训练阶段的数据加载器，支持按进程跳着读（rank、world_size，默认单进程）
 - `train_tokenizer.py`：训练自己的 BPE 分词器，结果存为 tokenizer_32k.json
 - `tokenizer.py`：加载了特殊 token 的分词器 enc，以及两个输入 str、返回 token_ids(list[int])的 render 函数
 - `model.py`：实现模型结构，内含 load_model 函数、ModelConfig
-- `pretrain.py`：预训练，内含 main、configure_optimizer、PretrainTask（每步取 grad_accum 份数据、提供 DataLoader 状态给 checkpoint）、train（薄外壳，返回每步 loss 和梯度范数）、load_checkpoint，支持 --config、--set、--resume
+- `pretrain.py`：预训练，内含 main、configure_optimizer、PretrainTask（每步取 grad_accum 份数据、提供 DataLoader 状态给 checkpoint）、train（薄外壳，返回每步 loss 和梯度范数）、load_checkpoint，支持 --config、--set、--resume；用 torchrun 启动时自动走 DDP 多卡
 - `sft_data.py`：提供一些处理 question、prompt、answer 的函数，以及 SEED、N_TEST 参数
 - `sft.py`：SFT，内含数据加载器 SFTLoader、SFTTask、train_sft（薄外壳，返回每步 loss 和梯度范数）和 main，支持 --config、--set、--resume
 - `eval_sft.py`：提供 evaluate_accuracy 函数，用贪心采样，对测试集计算准确率
 - `generate.py`：提供 generate 函数，简易的批量推理
 - `export_hf.py`：把 checkpoint 导出成 Hugging Face 格式（config.json + model.safetensors，transformers 可按 Qwen3ForCausalLM 直接加载），导出后自动读回对拍 logits 最大差和一段文本上的 loss；加 --gen 时再比较测试题上的贪心生成，支持 --ckpt、--out、--gen
 - `grpo.py`：GRPO，内含 rollout、build_rows（拼行补齐）、chunk_loss（算一块的 loss 和 KL）、compute_loss（分块算 loss 并 backward，供测试使用）、GRPOTask 和 train_grpo（薄外壳）和 main，支持 --config、--set、--resume
-- `trainer.py`：通用训练骨架。get_lr、set_lr 两个小函数，以及 Trainer 类（清梯度、逐份 backward、梯度裁剪、lr 调度、记录、日志、按间隔 eval、可选的 checkpoint 保存和 tok/s）
-- `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件
+- `trainer.py`：通用训练骨架。get_lr、set_lr 两个小函数，以及 Trainer 类（清梯度、逐份 backward、梯度裁剪、lr 调度、记录、日志、按间隔 eval、可选的 checkpoint 保存和 tok/s）；DDP 时梯度累积只在最后一份同步、每步 loss 跨进程平均、只有 0 号进程存 checkpoint（存包装前的模型）
+- `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件；多进程时只有 0 号进程输出
 - `muon.py`：newton_schulz 正交化函数和 MuonWithAdamW 优化器类（一个优化器内按参数组分别做 Muon 和 AdamW 更新）
+- `parallel/`：并行相关代码的包，以后 ZeRO、TP、PP 也放这里
+  - `dist_utils.py`：setup（读 torchrun 给的环境变量初始化进程组，GPU 用 nccl、CPU 用 gloo；没有这些变量时什么都不做）、get_rank、get_world_size、is_main、all_reduce_mean、cleanup
 - `pytest.ini`：配置了测试目录，默认跳过标了 slow 的测试
 - `tests/`：
   - `conftest.py`：公共 fixture，tiny_config（2 层、hidden 64、词表 256 的小模型配置）、sft_config（在 tiny_config 基础上把词表改成 32768、max_seq_len 改成 64，供用真分词器的 SFT / GRPO 测试使用）和 make_data_dir（在临时目录造随机 token 的 .bin 分片和 meta.json，可指定片数和每片 token 数）
   - `test_model.py`：模型各模块、参数量公式、初始化 loss
   - `test_tokenizer.py`：分词器和 BPE 训练（含 2 个慢测试）
   - `test_sft_data.py`：train / test 切分，构建 x, y 时只有答案和 `<|im_end|>` 参与 loss
-  - `test_dataloader.py`：换片、state_dict 往返
+  - `test_dataloader.py`：换片、state_dict 往返、按进程跳着读（world_size=2 的两个 loader 轮流取，与单进程连续取逐批相同）
   - `test_pretrain.py`：lr 调度；用假数据和小模型在 CPU 上跑 train()：AdamW / Muon 基线（每步 loss 和梯度范数）、单 batch overfit、load_model 读回 logits 一致、续训与一口气跑完逐位一致
   - `test_muon.py`：newton_schulz 正交化后的奇异值范围；MuonWithAdamW 的 AdamW 分支与 torch.optim.AdamW 逐步对拍
   - `test_sft.py`：16 道题、B=4 在 CPU 上跑 train_sft 10 步（过程中换轮打乱两次），AdamW / Muon 基线
   - `test_grpo.py`：compute_loss 分块与不分块的 loss、KL、梯度一致；先 SFT 200 步把小模型训到采样时有对有错，再跑 4 步 train_grpo，AdamW / Muon 基线，并断言出现过有对有错的题
   - `test_config.py`：正常读取、拼错键和节名报错、类型不对报错、--set 覆盖生效，以及 configs/ 下所有文件都能读通
   - `test_export_hf.py`：把 norm 权重随机化后的小模型导出，用 transformers 以 fp32 读回，检查没有漏读或多余的权重、logits 一致；没装 transformers 时自动跳过
+  - `test_ddp.py`：用 subprocess 在 CPU 上分别跑 pretrain.py 单进程和 torchrun 两进程（gloo），比较两边 final.pt 的参数和 val_loss；另测两进程中途续训与一口气跑完逐位相同
 - `config.py`：配置类（DataConfig、TrainConfig、SFTConfig、GRPOConfig、RunConfig，以及三个脚本各自的顶层配置类），load_config 读 TOML 并支持 --set 覆盖
 - `configs/`：adamw_112m、muon_112m 两条路线，每条 4 个配置文件（pretrain、sft、sft_weak、grpo），对应 v0.3 的 8 次运行
 
@@ -132,14 +155,15 @@
 - GPU：单张 RTX 4070 Ti Super 16GB，全程 bf16 autocast
 - Python 3.12.14，PyTorch 2.14.0+cu130，CUDA 13.0
 - 其他依赖：tiktoken 0.14.0、numpy 2.5.2、pyarrow 25.0.1、pytest 9.1.1；导出 HF 格式另需 transformers 5.19.0、safetensors 0.8.0
+- 多卡测速：Runpod 上的 4×RTX 4090 24GB（驱动 580，CUDA 13.0，卡间无 NVLink、不支持 P2P），软件版本与本地相同
 
 
 ### 测试
 
-`pytest -v`：跑快测试（37 个，约 16 秒，不需要数据）
+`pytest -v`：跑快测试（40 个，约 27 秒，不需要数据）
 `pytest -m slow -v`：跑慢测试（2 个，需要第 1 步下载的原始数据）
 
-训练循环的测试用假数据和小模型在 CPU 上以 fp32 运行，同一台机器上结果逐位可复现。基线记录的是当前代码每步的 loss 和梯度范数（相对误差 1e-5），只能说明行为没变，不能说明行为正确，所以另有 overfit 测试检查能否学会。有意改变训练行为时（如改 lr 调度）才重录基线，并在提交说明里写明。CPU 测试不覆盖 bf16 autocast 和训练速度。
+训练循环的测试用假数据和小模型在 CPU 上以 fp32 运行，同一台机器上结果逐位可复现。基线记录的是当前代码每步的 loss 和梯度范数（相对误差 1e-5），只能说明行为没变，不能说明行为正确，所以另有 overfit 测试检查能否学会。有意改变训练行为时（如改 lr 调度）才重录基线，并在提交说明里写明。CPU 测试不覆盖 bf16 autocast 和训练速度。DDP 的等价测试也在 CPU 上跑：把 CUDA_VISIBLE_DEVICES 置空，用 torchrun 起两个进程走 gloo，和以后在多卡机器上的启动方式相同。基线只保证在录它的机器上逐位一致，换一台机器时 Muon 和 GRPO 的基线可能在末几位对不上（在 Runpod 上实测有 4 个基线测试因此失败，其余全部通过）。
 
 SFT 和 GRPO 的基线用真分词器和小模型在 CPU 上跑，GRPO 另外记录每步的 KL 和平均奖励。GRPO 基线要求采样时有对有错：如果全对或全错，组内优势全为 0，策略梯度不起作用，基线就测不到它。临时把 compute_loss 里的优势取反时，GRPO 基线会失败而分块测试不受影响。
 
@@ -220,6 +244,19 @@ python export_hf.py --ckpt checkpoints/adamw_112m/sft.pt --out hf/adamw_112m/sft
 
 
 
+**9. 多卡（DDP）**：
+
+```bash
+torchrun --standalone --nproc_per_node=4 pretrain.py --config configs/muon_112m/pretrain.toml
+```
+
+- 只支持单机多卡。卡数要同时整除 8（65,536 ÷ B×T）和 eval_steps（默认 20），所以默认配置下可以用 1、2、4 张；用 8 张卡时要把 eval_steps 改成 8 的倍数，比如 `--set data.eval_steps=24`
+- 加 `--resume` 照样能续训；checkpoint 只由 0 号进程写，格式和单卡相同
+- 本地没有多卡时，可以用 CPU 验证多进程的逻辑：`CUDA_VISIBLE_DEVICES= torchrun --standalone --nproc_per_node=2 pretrain.py --config 小配置`，tests/test_ddp.py 就是这么做的
+- 复现上面的测速：加 `--set train.max_steps=300`，并用 `--set run.ckpt_dir=…`、`--set run.log=…` 指到临时目录；单卡那次用 python 启动，命令前加 `CUDA_VISIBLE_DEVICES=0`。前 300 步只用到第一片训练数据，云上只需传 train_000000.bin、val_000000.bin 和 meta.json
+
+
+
 ## 下一步
 
 先把训练这一侧做成框架，推理框架放到之后。按顺序推进：
@@ -229,7 +266,9 @@ python export_hf.py --ckpt checkpoints/adamw_112m/sft.pt --out hf/adamw_112m/sft
   - 已完成：把 Muon 和 AdamW 合并成一个优化器 MuonWithAdamW，configure_optimizer 返回单个对象
   - 已完成：实验参数改用配置文件描述
 2. 导出 HF 格式对拍（已完成）：导出 config.json + safetensors，用 transformers 加载后比较 logits 和贪心生成，验证模型实现
-3. 多卡并行：上云租 4 卡 5090，依次实现 DDP、ZeRO / FSDP、TP、PP
+3. 多卡并行：依次实现 DDP、ZeRO / FSDP、TP、PP
+  - 已完成：DDP（只用于预训练），4×RTX 4090 上扩展效率约 55%，瓶颈是卡间不支持 P2P 时的梯度通信
+  - 下一步：ZeRO / FSDP
 4. 性能优化
   - 先测 MFU，用 torch.profiler 定位瓶颈
   - 再依次尝试 torch.compile、把自写的 Triton FlashAttention 注册为 custom op 接入、分块计算 lm_head + cross-entropy（不物化完整 logits）
