@@ -11,6 +11,7 @@ from trainer import Trainer
 from config import PretrainExperiment, TrainConfig, DataConfig, load_config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from parallel.dist_utils import setup, cleanup, get_rank, get_world_size, all_reduce_mean
+from parallel.zero import ZeroOptimizer
 
 
 class PretrainTask:
@@ -64,7 +65,7 @@ def train(model: model.ModelForCausalLM,
     return records["loss"], records["norm"]
 
 
-def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig, optimizer_name):
+def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig, optimizer_name, zero_stage=0):
     lr, betas, weight_decay = train_config.max_lr, train_config.betas, train_config.weight_decay
     if optimizer_name == "adamw":
         wd, keep = [], []
@@ -77,12 +78,11 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         wd_numel = sum(p.numel() for p in wd)
         keep_numel = sum(p.numel() for p in keep)
         log(f"weight_decay: {len(wd)} tensors, {wd_numel} params | no_decay: {len(keep)} tensors, {keep_numel} params")
-        params = [
+        param_groups = [
             {"params": wd, "weight_decay": weight_decay},
             {"params": keep, "weight_decay": 0.0},
         ]
-        optimizer = torch.optim.AdamW(params, lr=lr, betas=betas, fused=True)
-        return optimizer
+        cls, kwargs = torch.optim.AdamW, dict(lr=lr, betas=betas, fused=True)
     elif optimizer_name == "muon":
         muon_params, wd, keep = [], [], []
         for name, p in model.named_parameters():
@@ -103,10 +103,18 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
             {"params": wd, "use_muon": False, "lr": lr, "weight_decay": weight_decay, "betas": betas},
             {"params": keep, "use_muon": False, "lr": lr, "weight_decay": 0.0, "betas": betas},
         ]
-        optimizer = MuonWithAdamW(param_groups)
-        return optimizer
+        cls, kwargs = MuonWithAdamW, {}
     else:
         raise ValueError(f"unknown optimizer: {optimizer_name!r}, expected one of: adamw, muon")
+    if zero_stage == 0:
+        # 不做 Zero
+        return cls(param_groups, **kwargs)
+    elif zero_stage == 1:
+        optimizer = ZeroOptimizer(param_groups, cls, **kwargs)
+        log(f"optimizer.world_size:{optimizer.world_size}, optimizer.numel_per_rank:{optimizer.numel_per_rank}")
+        return optimizer
+    else:
+        raise ValueError(f"zero_stage 只支持 0 和 1，收到 {zero_stage!r}")
 
 
 def evaluate(model, val_loader: dataloader.DataLoader, data_config: DataConfig):
