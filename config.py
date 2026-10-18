@@ -49,11 +49,17 @@ class RunConfig:
 
 
 @dataclass
+class ParallelConfig:
+    zero_stage: int = 0  # 0 是不切分，1 是 ZeRO-1
+
+
+@dataclass
 class PretrainExperiment:
     model: ModelConfig 
     data: DataConfig
     train: TrainConfig
     run: RunConfig
+    parallel: ParallelConfig
 
 
 @dataclass

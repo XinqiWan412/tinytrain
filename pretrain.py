@@ -149,7 +149,7 @@ def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
     return start_step
 
 
-def main(cfg, resume, device):
+def main(cfg: PretrainExperiment, resume, device):
     rank, world_size = get_rank(), get_world_size()
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
@@ -157,7 +157,7 @@ def main(cfg, resume, device):
 
     m = model.ModelForCausalLM(cfg.model)
     m.to(device)
-    optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer)
+    optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer, zero_stage=cfg.parallel.zero_stage)
 
     B, T = cfg.data.B, cfg.data.T
     loader = dataloader.DataLoader(data_dir, 'train', B, T, device, rank=rank, world_size=world_size)

@@ -66,7 +66,7 @@ class ZeroOptimizer:
         if "per_rank" not in state:
             raise ValueError("state 里没有 per_rank，该 checkpoint 不是 ZeRO-1 格式，可能是 zero_stage=0 时存的")
         if state["world_size"] != self.world_size:
-            raise ValueError(f"checkpoint 要求 world_size={state["world_size"]}, 当前 world_size={self.world_size}")
+            raise ValueError(f"checkpoint 要求 world_size={state['world_size']}, 当前 world_size={self.world_size}")
         # 加载本卡的那一项 state_dict
         self.optimizer.load_state_dict(state["per_rank"][self.rank])
 

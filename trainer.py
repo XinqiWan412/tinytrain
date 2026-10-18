@@ -113,20 +113,22 @@ class Trainer:
         text = ", ".join(f"{k}:{v:.4f}" for k, v in metrics.items())
         # 打印 log
         log(f"step:{step}, {text}")
-        if self.ckpt_dir is not None and is_main():
-            # 存 checkpoint
-            filename = "final.pt" if final else "latest.pt"
-            self._save(os.path.join(self.ckpt_dir, filename), step, metrics)
+        if self.ckpt_dir is not None:
+            opt_state = self.optimizer.state_dict()  # ZeRO 时这是集合通信，每个进程都要调用
+            if is_main():
+                # 存 checkpoint
+                filename = "final.pt" if final else "latest.pt"
+                self._save(os.path.join(self.ckpt_dir, filename), step, metrics, opt_state)
         self.model.train()
 
 
-    def _save(self, path, step, metrics):
+    def _save(self, path, step, metrics, opt_state):
         checkpoint = {
             # 用模型需要的
             "model": self.raw_model.state_dict(),
             "model_config": asdict(self.raw_model.config),
             # 接着训需要的
-            "optimizer": self.optimizer.state_dict(),
+            "optimizer": opt_state,
             "optimizer_name": self.optimizer_name,
             "step": step,  # 从这一步继续训
             # 留作记录的
