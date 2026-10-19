@@ -47,17 +47,17 @@ def run_train(optimizer_name, tmp_path, tiny_config, make_data_dir, n_train=2, t
     return losses, norms, model
 
 
+@pytest.mark.parametrize("zero_stage", [1, 2])
 @pytest.mark.parametrize("optimizer_name", ["adamw", "muon"])
-def test_zero1_matches_plain(optimizer_name, tiny_config, make_data_dir):
+def test_zero1_matches_plain(optimizer_name, zero_stage, tiny_config, make_data_dir):
     # zero_stage 0 和 1 各跑一遍，对比
-    zero_stage = 0
-    model_0, optimizer, loader, val_loader, train_config, data_config = build(optimizer_name, tiny_config, make_data_dir, zero_stage)
+    model_0, optimizer, loader, val_loader, train_config, data_config = build(optimizer_name, tiny_config, make_data_dir, zero_stage=0)
     losses_0, norms_0 = train(model_0, optimizer, loader, val_loader, train_config, data_config, optimizer_name, None)
-    zero_stage = 1
 
     model_1, optimizer, loader, val_loader, train_config, data_config = build(optimizer_name, tiny_config, make_data_dir, zero_stage)
     losses_1, norms_1 = train(model_1, optimizer, loader, val_loader, train_config, data_config, optimizer_name, None)
     assert isinstance(optimizer, ZeroOptimizer)
+    assert optimizer.stage == zero_stage
     
     assert losses_0 == losses_1
     assert norms_0 == norms_1

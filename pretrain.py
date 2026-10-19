@@ -109,12 +109,12 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
     if zero_stage == 0:
         # 不做 Zero
         return cls(param_groups, **kwargs)
-    elif zero_stage == 1:
-        optimizer = ZeroOptimizer(param_groups, cls, **kwargs)
-        log(f"optimizer.world_size:{optimizer.world_size}, optimizer.numel_per_rank:{optimizer.numel_per_rank}")
+    elif zero_stage in (1, 2):
+        optimizer = ZeroOptimizer(param_groups, cls, stage=zero_stage, **kwargs)
+        log(f"optimizer.world_size:{optimizer.world_size}, optimizer.numel_per_rank:{optimizer.numel_per_rank}, zero_stage:{zero_stage}")
         return optimizer
     else:
-        raise ValueError(f"zero_stage 只支持 0 和 1，收到 {zero_stage!r}")
+        raise ValueError(f"zero_stage 只支持 0、1、2，收到 {zero_stage!r}")
 
 
 def evaluate(model, val_loader: dataloader.DataLoader, data_config: DataConfig):

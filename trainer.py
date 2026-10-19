@@ -69,7 +69,12 @@ class Trainer:
                     part_extra_acc[k] = part_extra_acc.get(k, 0.0) + v
             loss_accum = all_reduce_mean(loss_accum)  # step_extra, part_extra 没有跨进程平均，目前只有预训练用 DDP，没有额外数字
             # 梯度裁剪
-            norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
+            if hasattr(self.optimizer, "reduce_grads"):
+                self.optimizer.reduce_grads()  # 梯度规约
+            if hasattr(self.optimizer, "clip_grad_norm_"):
+                norm = self.optimizer.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
+            else:
+                norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
             # 设学习率
             lr = get_lr(step, self.train_config)
             set_lr(self.optimizer, lr)

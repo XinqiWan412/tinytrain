@@ -17,15 +17,17 @@ def partition_params(sizes: list[int], world_size: int):
 
 
 class ZeroOptimizer:
-    def __init__(self, param_groups, optimizer_cls, **defaults):
+    def __init__(self, param_groups, optimizer_cls, stage=1, **defaults):
         self.rank = get_rank()
         self.world_size = get_world_size()
+        self.stage = stage
+        if stage not in (1, 2): raise ValueError(f"stage is {stage}, expected: 1, 2")
         self.params = [p for g in param_groups for p in g["params"]]
         self.owners, self.numel_per_rank = partition_params([p.numel() for p in self.params], self.world_size)
-        owner_of = dict(zip(self.params, self.owners))
+        self.owner_of = dict(zip(self.params, self.owners))
         local_groups = []
         for g in param_groups:
-            local_groups.append({**g, "params": [p for p in g["params"] if owner_of[p] == self.rank]})
+            local_groups.append({**g, "params": [p for p in g["params"] if self.owner_of[p] == self.rank]})
         self.optimizer = optimizer_cls(local_groups, **defaults)
 
     @property
@@ -70,4 +72,36 @@ class ZeroOptimizer:
         # 加载本卡的那一项 state_dict
         self.optimizer.load_state_dict(state["per_rank"][self.rank])
 
-        
+    def reduce_grads(self):
+        if self.stage == 1 or self.world_size == 1:
+            # ZeRO-1 和单进程不需要做梯度规约
+            return
+        for p, owner in zip(self.params, self.owners):
+            dist.reduce(p.grad, dst=owner)
+            if self.rank == owner:
+                # 如果是本卡的，就计算平均
+                p.grad.div_(self.world_size)
+            else:
+                p.grad = None
+
+    @torch.no_grad()
+    def clip_grad_norm_(self, parameters, max_norm):
+        if self.stage == 1:
+            return torch.nn.utils.clip_grad_norm_(parameters, max_norm)
+        params = list(parameters)
+        # 找出本卡对应的 p 和 g
+        idx = [i for i, p in enumerate(params) if self.owner_of[p] == self.rank]
+        grads = [params[i].grad for i in idx]
+        # 算本卡每个梯度的范数
+        own_norms = torch._foreach_norm(grads, 2.0)
+        norms = torch.zeros(len(params), dtype=grads[0].dtype, device=grads[0].device)
+        norms[idx] = torch.stack(own_norms)
+        # 规约得到所有 g 的范数
+        if self.world_size > 1:
+            dist.all_reduce(norms)
+        # 求全局范数 total
+        total = torch.linalg.vector_norm(norms, 2.0)
+        # 梯度裁剪
+        torch.nn.utils.clip_grads_with_norm_([params[i] for i in idx], max_norm, total)
+        return total
+
