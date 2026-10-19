@@ -1,7 +1,7 @@
 # tinytrain
 
 从零手写的 LLM 训练全流程：预训练 → SFT → GRPO。模型结构参考 Qwen3-0.6B，
-在单张 RTX 4070 Ti Super（16GB）上先用 1150 万参数的小模型跑通，再把全流程扩大到 1.12 亿参数。预训练支持 DDP 多卡（在 4×RTX 4090 上验证过），以及手写的 ZeRO-1。
+在单张 RTX 4070 Ti Super（16GB）上先用 1150 万参数的小模型跑通，再把全流程扩大到 1.12 亿参数。预训练支持 DDP 多卡和手写的 ZeRO-1、ZeRO-2，在 4×RTX 4090 和 4×A100 上测过。
 模型、数据加载、训练循环、对话模板、GRPO 都是自己实现的，没有用 transformers / trl。
 
 ## 结果
@@ -65,20 +65,29 @@
 
 
 
-### ZeRO-1：与 DDP 逐位相同
+### ZeRO-1 / ZeRO-2：与 DDP 逐位相同，4×A100 上对比
 
-本地用 gloo 起两个 CPU 进程验证（tests/test_zero.py）：同样的配置下，两进程 ZeRO-1 与两进程 DDP 各跑 10 步，final.pt 里的参数逐位相同、val_loss 相等，AdamW 和 Muon 都是；两进程中途续训与一口气跑完也逐位相同。每个参数的更新虽然只在负责它的那张卡上算，但用的梯度（DDP 已平均好）、公式和学习率都和 DDP 相同，算出的数原样广播出去，所以测试不留容差。
+本地用 gloo 起两个 CPU 进程验证（tests/test_zero.py）：同样的配置下，两进程 ZeRO-1、ZeRO-2 分别与两进程 DDP 各跑 10 步，final.pt 里的参数逐位相同、val_loss 相等，AdamW 和 Muon 都是；两进程中途续训与一口气跑完也逐位相同。每个参数的更新只在负责它的那张卡上算，但梯度、公式和学习率都和 DDP 相同；ZeRO-2 先把各卡梯度加起来再除以 2，DDP 先各乘 1/2 再相加，两卡时两者逐位相同；梯度裁剪的总范数也按 clip_grad_norm_ 的算法跨卡求出，所以测试不留容差。测试里各卡优化器状态的字节数相加正好等于 DDP 的总量（小模型 AdamW 1,512,032 字节、Muon 823,808 字节），每张卡都少于总量的 0.75。
 
-测试里各卡优化器状态的字节数相加正好等于 DDP 的总量（小模型 AdamW 1,512,032 字节、Muon 823,808 字节），每张卡都少于总量的 0.75。按同样的分配规则算 1.12 亿参数模型在 4 卡时的情况（未上云实测）：
+在 Runpod 上租一台 4×A100-SXM4-80GB（卡间 NVLink，支持 P2P），Muon 路线各跑前 300 步，只用 `--set parallel.zero_stage` 切换：
 
-|           | DDP 每张卡          | ZeRO-1 每张卡                                          |
-| --------- | ---------------- | --------------------------------------------------- |
-| 负责的元素数    | 全部 112,482,048   | 28,120,576 / 28,120,576 / 28,120,448 / 28,120,448 |
-| AdamW 优化器状态 | 约 900 MB         | 约 225 MB                                            |
-| Muon 优化器状态  | 约 551 MB         | 0 号约 213 MB，其余各约 113 MB                             |
+|                        | 单卡             | DDP             | ZeRO-1           | ZeRO-2           |
+| ---------------------- | -------------- | --------------- | ---------------- | ---------------- |
+| 每步时间                   | 710 ms         | 212 ms          | 192 ms           | 198 ms           |
+| 吞吐                     | 约 9.23 万 tok/s | 约 30.9 万 tok/s | 约 34.1 万 tok/s  | 约 33.0 万 tok/s  |
+| 扩展效率                   | —              | 84%             | 92%              | 89%              |
+| 峰值显存 allocated（0 号卡）   | 9,632 MiB      | 10,057 MiB      | 9,728 MiB        | 9,294 MiB        |
+| 峰值显存 allocated（其余各卡）  | —              | 10,057 MiB      | 9,635～9,640 MiB | 9,202～9,207 MiB |
+| 第 250 步 val loss        | 6.3354         | 6.3356          | 6.3356           | 6.3355           |
+| 第 300 步 val loss        | 6.0103         | 6.0104          | 6.0104           | 6.0104           |
 
-- Muon 路线不均匀：分配按元素数，embedding 归 0 号卡，它走 AdamW，每个元素存两份状态，Muon 矩阵只存一份 buf
-- 显存的大头是激活（上面 DDP 四卡时每张卡 11,304 MiB），每张卡省下的几百 MB 占比不大；通信反而比 DDP 多一轮参数广播（每个参数一次，112M 模型每步 134 次）。速度和实测显存等 ZeRO-2 写完后上云一起测
+- 每步时间取第 20～300 步（每 20 步一行日志）的平均；峰值显存是 torch.cuda.max_memory_allocated，训练结束时收集各卡的值由 0 号进程打印
+- 显存的差别都能和预计对上（10 MiB 左右以内）：DDP 比单卡多出 425 MiB，是它做 all-reduce 用的梯度桶（全部梯度 450 MB = 429 MiB）；ZeRO-1 比 DDP 少的是切开的优化器状态（Muon 路线下每卡一整份约 525 MiB，ZeRO-1 时 0 号卡约 203 MiB、其余各约 107 MiB，预计省 322 / 418 MiB，实测 329 / 417～422 MiB）；ZeRO-2 比 ZeRO-1 每张卡又少约 430 MiB，来自不包 DDP、没有梯度桶。ZeRO-2 汇总后扔掉不归自己管的梯度，并没有降低峰值：峰值在反向刚结束时，那时全部梯度都还在
+- ZeRO-1 比 DDP 快 20 ms（推断，没有单独测优化器那一步的耗时）：每张卡只更新自己负责的参数，Muon 的正交化从 84 个矩阵减到最多 26 个，省下的计算比多出的一轮参数广播（450 MB，NVLink 上只要几毫秒）多。卡间连接慢时结论可能相反：上面那台 4090 上，450 MB 的 all-reduce 就要 175 ms
+- ZeRO-2 比 ZeRO-1 慢 6 ms：这里实现的是简单版，反向全部算完后才逐个参数 reduce，没有像 DDP 那样和最后一份反向重叠，还多了 134 次调用的固定开销；它省下的通信量在 NVLink 上值不了几毫秒
+- 据此决定不做两件事：把 134 次逐参数的小通信按卡合并（最多省几毫秒，不到每步的 3%）；给 ZeRO-2 加 hook，让梯度边算边发、边释放（提速的上限就是这 6 ms；每张卡要累积 2 份梯度，第一份算完全部梯度就已在显存里，边算边释放也赶不上峰值）
+- loss：DDP 与 ZeRO-1 相同；ZeRO-2 和单卡只在末位不同，来自梯度相加的顺序不同
+- 同样是 DDP，这台 A100 的扩展效率是 84%，上面那台卡间不支持 P2P 的 4090 只有 55%
 
 
 
@@ -126,6 +135,7 @@
 - Muon（muon.py）：动量（0.95，Nesterov）之后用 Newton-Schulz 迭代 5 次把动量矩阵近似正交化（只用矩阵乘，bf16），让各奇异方向的步长一致；更新系数用 Moonlight 的 0.2×√max(行, 列)，使更新幅度与 AdamW 对齐，lr、weight decay 和调度都直接沿用 AdamW；按参数形状分组：块内的 2 维矩阵（q/k/v/o 和 MLP 三个矩阵）用 Muon，embedding（与 lm_head 共享）和 1 维 norm 参数仍用 AdamW；两部分装在同一个优化器类 MuonWithAdamW 里：它继承 torch.optim.Optimizer，参数组用 use_muon 标记，step 时按组分别走 Muon 和 AdamW 的更新（AdamW 部分手写，运算顺序与 torch 的非 fused 实现一致，tests/test_muon.py 里与 torch.optim.AdamW 逐步对拍）；configure_optimizer 返回单个优化器，Trainer 直接调用它的 zero_grad / step
 - DDP（只用于预训练）：用 torchrun 启动时，rank、world_size 从环境变量读，GPU 用 nccl、CPU 用 gloo；直接用 python 启动时走原来的单进程路径，现有测试和基线不变。全局 batch 保持 65,536，每个进程的累积次数 = 全局 batch ÷（B×T×进程数），4 卡时每卡累积 2 次。数据按进程跳着读：DataLoader 的 pos 是所有进程共同的位置，读数据时再加上 rank×B×T 的偏移，每批前进 进程数×B×T，所有进程在同一步换片；state_dict 不用改，续训时各进程自动回到自己的位置。这样每一步各进程合起来读的正是单进程会读的那些 token，平均后的梯度和单进程相同，只差浮点加法顺序。梯度累积时最后一份之前用 no_sync 跳过同步（前向和反向一起包住）；日志里的 loss 和 val_loss 先跨进程平均；只有 0 号进程写日志、存 checkpoint，存的是包装前的模型，键不带 "module." 前缀，load_model、export_hf、sft.py 照常能读。正确性在本地用 gloo 起两个 CPU 进程验证：tests/test_ddp.py 用 subprocess 分别跑单进程和两进程，比较 final.pt；另测两进程中途续训与一口气跑完逐位相同。临时去掉 rank 偏移时，交替读取测试和等价测试失败；load_state_dict 里重复加偏移时，只有续训测试失败
 - ZeRO-1（只用于预训练，配置 `[parallel] zero_stage = 1`，默认 0 即原来的做法）：每个参数整个归一张卡负责，不像常见做法那样拍平后按元素切，因为 Muon 的正交化要完整矩阵。partition_params 按元素数从大到小，每次放到当前最轻的卡上，只依赖参数大小和卡数，各进程算出的分配相同；112M 模型 2 卡、4 卡时各卡元素数几乎相等，8 卡时 embedding（2516 万）一个参数就超过平均值，0 号卡偏重。parallel/zero.py 的 ZeroOptimizer 包住原来的优化器：只用本卡负责的参数建里面的 AdamW / MuonWithAdamW（两者一行不改，Muon 的正交化也随之分摊到各卡）；param_groups 直接交出里面那个优化器的，Trainer 的 set_lr 照常生效；zero_grad 清全部参数的梯度（DDP 每步把平均后的梯度写进全部参数，没清的会累加，还会经 all-reduce 带坏别的卡）；step 后每个参数由负责它的卡广播给其他卡，每张卡都按同样顺序对每个参数调用。梯度同步仍由 DDP 做，Trainer 只改了存 checkpoint：所有进程先一起调 state_dict（各卡状态搬到 CPU 后用 gather_object 收集到 0 号进程，存成每卡一项的列表，并记下卡数），再由 0 号进程写文件；续训时每张卡取自己那一项，卡数不同时报错，load_checkpoint 不用改。临时让每张卡给全部参数建优化器时，等价比较照样通过，只有字节数检查失败；临时去掉广播时，从第 1 步起错误经梯度平均扩散到全部参数，等价测试和续训测试都失败
+- ZeRO-2（配置 `zero_stage = 2`）：在 ZeRO-1 的基础上把梯度也切开，不再包 DDP。ZeroOptimizer 多了 stage 参数和两个方法：reduce_grads 在反向全部算完后对每个参数做一次 reduce，把各卡梯度加到负责它的卡上，由它除以卡数，其他卡把这份梯度设成 None；clip_grad_norm_ 跨卡算总范数，算法与 torch 的 clip_grad_norm_ 一致：用 _foreach_norm 算本卡负责参数的范数，按传入参数的顺序填进全 0 向量，跨卡相加（每个位置只有一张卡有值，加 0 不引入误差）后再求一次范数，最后用 clip_grads_with_norm_ 缩放本卡的梯度。Trainer 不认识 ZeRO：优化器有 reduce_grads 就在逐份 backward 之后调用，有 clip_grad_norm_ 就用它代替 torch 的，普通优化器照旧（ZeRO-1 的 clip_grad_norm_ 直接调 torch 的）。不包 DDP 后，梯度累积不再需要 no_sync；开头（续训时在读完 checkpoint 之后）由 0 号卡广播一次参数，并打一行日志确认没包 DDP：忘了去掉 DDP 时，结果照样与 DDP 逐位相同，测试查不出来。训练结束时把各卡的峰值显存收集到 0 号进程打印。临时让总范数只用本卡的梯度算时，只有两进程与 DDP 的等价测试失败（单进程不跨卡，续训两边错得一样）；临时不把不负责的梯度设成 None 时，只有专门检查这一点的测试失败（训练结果不变）
 
 
 ## 项目结构
@@ -135,19 +145,19 @@
 - `train_tokenizer.py`：训练自己的 BPE 分词器，结果存为 tokenizer_32k.json
 - `tokenizer.py`：加载了特殊 token 的分词器 enc，以及两个输入 str、返回 token_ids(list[int])的 render 函数
 - `model.py`：实现模型结构，内含 load_model 函数、ModelConfig
-- `pretrain.py`：预训练，内含 main、configure_optimizer、PretrainTask（每步取 grad_accum 份数据、提供 DataLoader 状态给 checkpoint）、train（薄外壳，返回每步 loss 和梯度范数）、load_checkpoint，支持 --config、--set、--resume；用 torchrun 启动时自动走 DDP 多卡，configure_optimizer 按 [parallel] zero_stage 决定是否用 ZeroOptimizer 包装
+- `pretrain.py`：预训练，内含 main、configure_optimizer、PretrainTask（每步取 grad_accum 份数据、提供 DataLoader 状态给 checkpoint）、train（薄外壳，返回每步 loss 和梯度范数）、load_checkpoint，支持 --config、--set、--resume；用 torchrun 启动时自动走多卡：zero_stage 为 0、1 时包 DDP，为 2 时不包、改由 0 号卡广播一次参数；configure_optimizer 按 zero_stage 决定是否用 ZeroOptimizer 包装；训练结束时打印各卡峰值显存
 - `sft_data.py`：提供一些处理 question、prompt、answer 的函数，以及 SEED、N_TEST 参数
-- `sft.py`：SFT，内含数据加载器 SFTLoader、SFTTask、train_sft（薄外壳，返回每步 loss 和梯度范数）和 main，支持 --config、--set、--resume
+- `sft.py`：SFT，内含数据加载器 SFTLoader、SFTTask、train_sft（薄外壳，返回每步 loss 和梯度范数）和 main，支持 --config、--set
 - `eval_sft.py`：提供 evaluate_accuracy 函数，用贪心采样，对测试集计算准确率
 - `generate.py`：提供 generate 函数，简易的批量推理
 - `export_hf.py`：把 checkpoint 导出成 Hugging Face 格式（config.json + model.safetensors，transformers 可按 Qwen3ForCausalLM 直接加载），导出后自动读回对拍 logits 最大差和一段文本上的 loss；加 --gen 时再比较测试题上的贪心生成，支持 --ckpt、--out、--gen
-- `grpo.py`：GRPO，内含 rollout、build_rows（拼行补齐）、chunk_loss（算一块的 loss 和 KL）、compute_loss（分块算 loss 并 backward，供测试使用）、GRPOTask 和 train_grpo（薄外壳）和 main，支持 --config、--set、--resume
-- `trainer.py`：通用训练骨架。get_lr、set_lr 两个小函数，以及 Trainer 类（清梯度、逐份 backward、梯度裁剪、lr 调度、记录、日志、按间隔 eval、可选的 checkpoint 保存和 tok/s）；DDP 时梯度累积只在最后一份同步、每步 loss 跨进程平均、存 checkpoint 时所有进程先一起取优化器状态（ZeRO 时要收集各卡状态），再由 0 号进程写文件（存包装前的模型）
+- `grpo.py`：GRPO，内含 rollout、build_rows（拼行补齐）、chunk_loss（算一块的 loss 和 KL）、compute_loss（分块算 loss 并 backward，供测试使用）、GRPOTask 和 train_grpo（薄外壳）和 main，支持 --config、--set
+- `trainer.py`：通用训练骨架。get_lr、set_lr 两个小函数，以及 Trainer 类（清梯度、逐份 backward、梯度裁剪、lr 调度、记录、日志、按间隔 eval、可选的 checkpoint 保存和 tok/s）；DDP 时梯度累积只在最后一份同步；每步 loss 跨进程平均；优化器有 reduce_grads 就在逐份 backward 之后调用，有自己的 clip_grad_norm_ 就用它代替 torch 的（ZeRO-2 靠这两处接入）；存 checkpoint 时所有进程先一起取优化器状态（ZeRO 时要收集各卡状态），再由 0 号进程写文件（存包装前的模型）
 - `logger.py`：公共日志模块，setup_log 打开日志文件，log 同时打印并写入文件；多进程时只有 0 号进程输出
 - `muon.py`：newton_schulz 正交化函数和 MuonWithAdamW 优化器类（一个优化器内按参数组分别做 Muon 和 AdamW 更新）
 - `parallel/`：并行相关代码的包，以后 TP、PP 也放这里
-  - `dist_utils.py`：setup（读 torchrun 给的环境变量初始化进程组，GPU 用 nccl、CPU 用 gloo；没有这些变量时什么都不做）、get_rank、get_world_size、is_main、all_reduce_mean、cleanup
-  - `zero.py`：partition_params（按元素数从大到小把整个参数分给当前最轻的卡）和 ZeroOptimizer（ZeRO-1 包装类：只给本卡负责的参数建里面的优化器，zero_grad 清全部参数，step 后广播参数，state_dict 把各卡状态收集到 0 号进程）
+  - `dist_utils.py`：setup（读 torchrun 给的环境变量初始化进程组，GPU 用 nccl、CPU 用 gloo；没有这些变量时什么都不做）、get_rank、get_world_size、is_main、all_reduce_mean、broadcast_params（从 0 号卡广播全部参数）、all_gather_list（收集各进程的一个对象）、cleanup
+  - `zero.py`：partition_params（按元素数从大到小把整个参数分给当前最轻的卡）和 ZeroOptimizer（ZeRO-1 / ZeRO-2 包装类：只给本卡负责的参数建里面的优化器，zero_grad 清全部参数，step 后广播参数，state_dict 把各卡状态收集到 0 号进程；stage 2 时另有 reduce_grads 把梯度汇总到负责的卡、clip_grad_norm_ 跨卡算总范数）
 - `pytest.ini`：配置了测试目录，默认跳过标了 slow 的测试
 - `tests/`：
   - `conftest.py`：公共 fixture，tiny_config（2 层、hidden 64、词表 256 的小模型配置）、sft_config（在 tiny_config 基础上把词表改成 32768、max_seq_len 改成 64，供用真分词器的 SFT / GRPO 测试使用）和 make_data_dir（在临时目录造随机 token 的 .bin 分片和 meta.json，可指定片数和每片 token 数）
@@ -162,7 +172,8 @@
   - `test_config.py`：正常读取、拼错键和节名报错、类型不对报错、--set 覆盖生效，以及 configs/ 下所有文件都能读通
   - `test_export_hf.py`：把 norm 权重随机化后的小模型导出，用 transformers 以 fp32 读回，检查没有漏读或多余的权重、logits 一致；没装 transformers 时自动跳过
   - `test_ddp.py`：用 subprocess 在 CPU 上分别跑 pretrain.py 单进程和 torchrun 两进程（gloo），比较两边 final.pt 的参数和 val_loss；另测两进程中途续训与一口气跑完逐位相同
-  - `test_zero.py`：分配函数的手算例子；单进程下包装与不包装各训练 10 步逐位相同、单进程续训（AdamW / Muon）；用 subprocess 起 torchrun 两进程（gloo），ZeRO-1 与 DDP 的 final.pt 逐位相同、两进程中途续训与一口气跑完逐位相同、各卡优化器状态字节数相加等于总量且每卡少于总量的 0.75
+  - `test_zero.py`：分配函数的手算例子；单进程下包装（zero_stage 1、2）与不包装各训练 10 步逐位相同，ZeRO-1 单进程续训（AdamW / Muon）；用 subprocess 起 torchrun 两进程（gloo），ZeRO-1、ZeRO-2 分别与 DDP 的 final.pt 逐位相同、两进程中途续训与一口气跑完逐位相同、各卡优化器状态字节数相加等于总量且每卡少于总量的 0.75，ZeRO-2 时检查日志里确实没包 DDP；用 zero2_worker.py 检查汇总后负责的梯度等于 DDP 式平均、不负责的梯度为 None
+  - `zero2_worker.py`：不是测试文件，由 test_zero.py 用 torchrun 起两个进程运行
 - `config.py`：配置类  （DataConfig、TrainConfig、SFTConfig、GRPOConfig、RunConfig、ParallelConfig，以及三个脚本各自的顶层配置类），load_config 读 TOML 并支持 --set 覆盖
 - `configs/`：adamw_112m、muon_112m 两条路线，每条 4 个配置文件（pretrain、sft、sft_weak、grpo），对应 v0.3 的 8 次运行
 
@@ -176,14 +187,15 @@
 - Python 3.12.14，PyTorch 2.14.0+cu130，CUDA 13.0
 - 其他依赖：tiktoken 0.14.0、numpy 2.5.2、pyarrow 25.0.1、pytest 9.1.1；导出 HF 格式另需 transformers 5.19.0、safetensors 0.8.0
 - 多卡测速：Runpod 上的 4×RTX 4090 24GB（驱动 580，CUDA 13.0，卡间无 NVLink、不支持 P2P），软件版本与本地相同
+- ZeRO 对比：Runpod 上的 4×A100-SXM4-80GB（卡间 NVLink，支持 P2P），PyTorch 2.14.0+cu130
 
 
 ### 测试
 
-`pytest -v`：跑快测试（49 个，约 55 秒，不需要数据）
+`pytest -v`：跑快测试（56 个，约 85 秒，不需要数据）
 `pytest -m slow -v`：跑慢测试（2 个，需要第 1 步下载的原始数据）
 
-训练循环的测试用假数据和小模型在 CPU 上以 fp32 运行，同一台机器上结果逐位可复现。基线记录的是当前代码每步的 loss 和梯度范数（相对误差 1e-5），只能说明行为没变，不能说明行为正确，所以另有 overfit 测试检查能否学会。有意改变训练行为时（如改 lr 调度）才重录基线，并在提交说明里写明。CPU 测试不覆盖 bf16 autocast 和训练速度。DDP 的等价测试也在 CPU 上跑：把 CUDA_VISIBLE_DEVICES 置空，用 torchrun 起两个进程走 gloo，和以后在多卡机器上的启动方式相同。ZeRO-1 的等价测试比较的是两进程 ZeRO-1 和两进程 DDP，两边都用 torchrun 启动，要求逐位相同；DDP 的等价测试比较的是 python 单进程和 torchrun 两进程，而 torchrun 会给每个进程设 OMP_NUM_THREADS=1，CPU 上矩阵乘的线程数不同，加法顺序就不同，末位会有差别，所以留了 1e-5 的容差。基线只保证在录它的机器上逐位一致，换一台机器时 Muon 和 GRPO 的基线可能在末几位对不上（在 Runpod 上实测有 4 个基线测试因此失败，其余全部通过）。
+训练循环的测试用假数据和小模型在 CPU 上以 fp32 运行，同一台机器上结果逐位可复现。基线记录的是当前代码每步的 loss 和梯度范数（相对误差 1e-5），只能说明行为没变，不能说明行为正确，所以另有 overfit 测试检查能否学会。有意改变训练行为时（如改 lr 调度）才重录基线，并在提交说明里写明。CPU 测试不覆盖 bf16 autocast 和训练速度。DDP 的等价测试也在 CPU 上跑：把 CUDA_VISIBLE_DEVICES 置空，用 torchrun 起两个进程走 gloo，和以后在多卡机器上的启动方式相同。ZeRO-1、ZeRO-2 的等价测试比较的是两进程 ZeRO 和两进程 DDP，两边都用 torchrun 启动，要求逐位相同；DDP 的等价测试比较的是 python 单进程和 torchrun 两进程，而 torchrun 会给每个进程设 OMP_NUM_THREADS=1，CPU 上矩阵乘的线程数不同，加法顺序就不同，末位会有差别，所以留了 1e-5 的容差。基线只保证在录它的机器上逐位一致，换一台机器时 Muon 和 GRPO 的基线可能在末几位对不上（在 Runpod 上实测有 4 个基线测试因此失败，其余全部通过）。
 
 SFT 和 GRPO 的基线用真分词器和小模型在 CPU 上跑，GRPO 另外记录每步的 KL 和平均奖励。GRPO 基线要求采样时有对有错：如果全对或全错，组内优势全为 0，策略梯度不起作用，基线就测不到它。临时把 compute_loss 里的优势取反时，GRPO 基线会失败而分块测试不受影响。
 
@@ -210,7 +222,7 @@ hf download HuggingFaceFW/fineweb-edu --repo-type dataset \
 `python pretrain.py --config configs/adamw_112m/pretrain.toml`
 
 - 输入：上一步的 .bin 分片
-- 输出：`checkpoints/final.pt`
+- 输出：`checkpoints/adamw_112m/final.pt`
 - 1.12 亿参数，34,000 步，每步 65,536 token（B=16、T=512、累积 8 次），约 1.34 s/步，共约 13 小时
 - 预期：val loss 约 3.15
 - 长跑建议放在 tmux 里。日志追加写进 run.log 指定的文件（logs/adamw_112m/pretrain.log），可用 `tail -f` 实时查看；中断后在原命令后加 `--resume`，会从 `checkpoints/adamw_112m/latest.pt`（每 250 步存一次）接着训练
@@ -264,17 +276,17 @@ python export_hf.py --ckpt checkpoints/adamw_112m/sft.pt --out hf/adamw_112m/sft
 
 
 
-**9. 多卡（DDP / ZeRO-1）**：
+**9. 多卡（DDP / ZeRO）**：
 
 ```bash
 torchrun --standalone --nproc_per_node=4 pretrain.py --config configs/muon_112m/pretrain.toml
 ```
 
 - 只支持单机多卡。卡数要同时整除 8（65,536 ÷ B×T）和 eval_steps（默认 20），所以默认配置下可以用 1、2、4 张；用 8 张卡时要把 eval_steps 改成 8 的倍数，比如 `--set data.eval_steps=24`
-- 加 `--resume` 照样能续训；checkpoint 只由 0 号进程写，格式和单卡相同
+- 加 `--resume` 照样能续训；DDP 时 checkpoint 只由 0 号进程写，格式和单卡相同
 - 本地没有多卡时，可以用 CPU 验证多进程的逻辑：`CUDA_VISIBLE_DEVICES= torchrun --standalone --nproc_per_node=2 pretrain.py --config 小配置`，tests/test_ddp.py 就是这么做的
 - 复现上面的测速：加 `--set train.max_steps=300`，并用 `--set run.ckpt_dir=…`、`--set run.log=…` 指到临时目录；单卡那次用 python 启动，命令前加 `CUDA_VISIBLE_DEVICES=0`。前 300 步只用到第一片训练数据，云上只需传 train_000000.bin、val_000000.bin 和 meta.json
-- 加 `--set parallel.zero_stage=1` 用 ZeRO-1，各卡只存自己负责的那些参数的优化器状态。checkpoint 的 optimizer 一项变成每卡一项的列表，续训时卡数必须和存的时候相同；zero_stage=0 和 1 存的 checkpoint 不能互相续训
+- 加 `--set parallel.zero_stage=1` 用 ZeRO-1（只切优化器状态），`=2` 用 ZeRO-2（梯度也切开，不包 DDP）。两者都是各卡只存自己负责的那些参数的优化器状态，checkpoint 的 optimizer 一项变成每卡一项的列表，续训时卡数必须和存的时候相同；zero_stage=0 存的 checkpoint 和 ZeRO 存的不能互相续训。上面 4×A100 的对比就是同一条命令，只改 zero_stage
 
 
 
@@ -290,7 +302,8 @@ torchrun --standalone --nproc_per_node=4 pretrain.py --config configs/muon_112m/
 3. 多卡并行：依次实现 DDP、ZeRO / FSDP、TP、PP
   - 已完成：DDP（只用于预训练），4×RTX 4090 上扩展效率约 55%，瓶颈是卡间不支持 P2P 时的梯度通信
   - 已完成：ZeRO-1（只切优化器状态，整个参数分给各卡；本地验证与 DDP 逐位相同）
-  - 下一步：ZeRO-2（梯度只汇总到负责的卡，总通信量回到 DDP 的水平），写完后上云一次测 DDP、ZeRO-1、ZeRO-2 的速度和显存，并据实测决定要不要合并逐参数的小通信；再往后是 FSDP2（ZeRO-3）
+  - 已完成：ZeRO-2（梯度也切开，不包 DDP；本地验证与 DDP 逐位相同）。4×A100 上 DDP、ZeRO-1、ZeRO-2 的扩展效率分别为 84%、92%、89%；据实测不再合并逐参数的小通信，也不加 hook 做通信与反向重叠
+  - 下一步：FSDP2（ZeRO-3，连参数也切开），用 PyTorch 自带的 fully_shard，先做 AdamW 路线；Muon 在参数切开后要先凑齐整个梯度矩阵才能正交化，需要另外处理
 4. 性能优化
   - 先测 MFU，用 torch.profiler 定位瓶颈
   - 再依次尝试 torch.compile、把自写的 Triton FlashAttention 注册为 custom op 接入、分块计算 lm_head + cross-entropy（不物化完整 logits）
