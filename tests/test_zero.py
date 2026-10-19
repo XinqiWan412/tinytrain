@@ -49,8 +49,8 @@ def run_train(optimizer_name, tmp_path, tiny_config, make_data_dir, n_train=2, t
 
 @pytest.mark.parametrize("zero_stage", [1, 2])
 @pytest.mark.parametrize("optimizer_name", ["adamw", "muon"])
-def test_zero1_matches_plain(optimizer_name, zero_stage, tiny_config, make_data_dir):
-    # zero_stage 0 和 1 各跑一遍，对比
+def test_zero_matches_plain(optimizer_name, zero_stage, tiny_config, make_data_dir):
+    # 不包装和 zero_stage 各跑一遍，对比
     model_0, optimizer, loader, val_loader, train_config, data_config = build(optimizer_name, tiny_config, make_data_dir, zero_stage=0)
     losses_0, norms_0 = train(model_0, optimizer, loader, val_loader, train_config, data_config, optimizer_name, None)
 
@@ -137,20 +137,23 @@ def run_two(config_path, out_dir, zero_stage, resume=False):
     return run_subprocess(cmd)
 
 
+@pytest.mark.parametrize("zero_stage", [1, 2])
 @pytest.mark.parametrize("optimizer_name", ["adamw", "muon"])
-def test_zero1_matches_ddp(optimizer_name, tmp_path, make_data_dir):
+def test_zero_matches_ddp(optimizer_name, zero_stage, tmp_path, make_data_dir):
     # 造数据，写配置
     data_dir = make_data_dir(n_train=2, tokens_per_shard=129)
     config_path = write_config(tmp_path, data_dir, optimizer_name)
     # 跑 ddp 和 zero
     run_two(config_path, tmp_path / "ddp", 0)
-    run_two(config_path, tmp_path / "zero", 1)
+    result = run_two(config_path, tmp_path / "zero", zero_stage)
     # 加载两边的 final.pt
     ckpt_path1 = tmp_path / "ddp" / "final.pt"
     ckpt_path2 = tmp_path / "zero" / "final.pt"
     ckpt1 = torch.load(ckpt_path1, map_location="cpu")  # ddp
     ckpt2 = torch.load(ckpt_path2, map_location="cpu")  # zero
-    assert ckpt2["optimizer"]["world_size"] == 2, "zero_stage=1 没生效"
+    assert ckpt2["optimizer"]["world_size"] == 2, "zero_stage 没生效"
+    assert ckpt2["config"]["parallel"]["zero_stage"] == zero_stage
+    if zero_stage == 2: assert "不包 DDP" in result.stdout
     # 比较参数
     sd1 = ckpt1["model"]
     sd2 = ckpt2["model"]
@@ -169,18 +172,19 @@ def test_zero1_matches_ddp(optimizer_name, tmp_path, make_data_dir):
     assert all(num < total * 0.75 for num in per_rank)
 
 
+@pytest.mark.parametrize("zero_stage", [1, 2])
 @pytest.mark.parametrize("optimizer_name", ["adamw", "muon"])
-def test_zero1_resume_two(optimizer_name, tmp_path, make_data_dir):
+def test_zero_resume_two(optimizer_name, zero_stage, tmp_path, make_data_dir):
     # 造数据，写配置
     data_dir = make_data_dir(n_train=2, tokens_per_shard=129)
     config_path = write_config(tmp_path, data_dir, optimizer_name)
     # 一口气跑完
-    run_two(config_path, tmp_path / "full", 1)
+    run_two(config_path, tmp_path / "full", zero_stage)
     # 把 latest.pt 复制到另一个目录
     (tmp_path / "resume").mkdir()
     shutil.copy(tmp_path / "full" / "latest.pt", tmp_path / "resume" / "latest.pt")
     # 续训
-    result = run_two(config_path, tmp_path / "resume", 1, resume=True)
+    result = run_two(config_path, tmp_path / "resume", zero_stage, resume=True)
     assert "resume from step 5" in result.stdout, "续训失败"
     # 加载两边的 final.pt
     ckpt_path1 = tmp_path / "full" / "final.pt"
@@ -204,3 +208,12 @@ def state_bytes(sd):
     return sum(v.numel() * v.element_size() for s in sd["state"].values() for v in s.values() if torch.is_tensor(v))
 
 
+def test_zero2_reduce_keeps_own_grads():
+    path = Path(__file__).parent / "zero2_worker.py"
+    cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone",
+    "--nproc_per_node=2", str(path)]
+    result = run_subprocess(cmd)
+    assert "rank 0 OK" in result.stdout
+    assert "rank 1 OK" in result.stdout
+
+    

@@ -52,3 +52,9 @@ def cleanup():
     if dist.is_available() and dist.is_initialized():
         dist.destroy_process_group()
 
+
+def broadcast_params(model, src=0):
+    with torch.no_grad():
+        for p in model.parameters():
+            dist.broadcast(p, src=src)
+

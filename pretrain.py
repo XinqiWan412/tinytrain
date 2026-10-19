@@ -10,7 +10,7 @@ from muon import MuonWithAdamW
 from trainer import Trainer
 from config import PretrainExperiment, TrainConfig, DataConfig, load_config
 from torch.nn.parallel import DistributedDataParallel as DDP
-from parallel.dist_utils import setup, cleanup, get_rank, get_world_size, all_reduce_mean
+from parallel.dist_utils import broadcast_params, setup, cleanup, get_rank, get_world_size, all_reduce_mean
 from parallel.zero import ZeroOptimizer
 
 
@@ -168,7 +168,12 @@ def main(cfg: PretrainExperiment, resume, device):
         path = os.path.join(cfg.run.ckpt_dir, "latest.pt")
         start_step = load_checkpoint(path, m, optimizer, cfg.train.optimizer, loader, device)
     if world_size > 1:
-        m = DDP(m, forward_sync_buffers=False)
+        if cfg.parallel.zero_stage == 2:
+            # ZeRO-2 不能用 DDP 包
+            broadcast_params(m)
+            log(f"zero_stage=2：不包 DDP，参数已从 0 号卡广播")
+        else:
+            m = DDP(m, forward_sync_buffers=False)
     # 开始训练
     train(m, optimizer, loader, val_loader, cfg.train, cfg.data, cfg.train.optimizer, cfg.run.ckpt_dir, start_step=start_step, config=cfg)
 
