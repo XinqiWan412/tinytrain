@@ -58,3 +58,15 @@ def broadcast_params(model, src=0):
         for p in model.parameters():
             dist.broadcast(p, src=src)
 
+
+def all_gather_list(obj):
+    world_size = get_world_size()
+    if world_size == 1:
+        # 单进程
+        return [obj]
+    else:
+        # 多进程
+        out = [None] * world_size
+        dist.all_gather_object(out, obj)
+        return out
+

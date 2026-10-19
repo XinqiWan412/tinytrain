@@ -10,7 +10,7 @@ from muon import MuonWithAdamW
 from trainer import Trainer
 from config import PretrainExperiment, TrainConfig, DataConfig, load_config
 from torch.nn.parallel import DistributedDataParallel as DDP
-from parallel.dist_utils import broadcast_params, setup, cleanup, get_rank, get_world_size, all_reduce_mean
+from parallel.dist_utils import all_gather_list, broadcast_params, setup, cleanup, get_rank, get_world_size, all_reduce_mean
 from parallel.zero import ZeroOptimizer
 
 
@@ -176,6 +176,17 @@ def main(cfg: PretrainExperiment, resume, device):
             m = DDP(m, forward_sync_buffers=False)
     # 开始训练
     train(m, optimizer, loader, val_loader, cfg.train, cfg.data, cfg.train.optimizer, cfg.run.ckpt_dir, start_step=start_step, config=cfg)
+    # 打印训练显存峰值
+    if torch.cuda.is_available():
+        alloc = torch.cuda.max_memory_allocated() // 2**20
+        reserved = torch.cuda.max_memory_reserved() // 2**20
+    else:
+        alloc = reserved = 0
+    peaks = all_gather_list((alloc, reserved))
+    allocs = [p[0] for p in peaks]
+    reserveds = [p[1] for p in peaks]
+    log(f"峰值显存（MiB，按 rank）：allocated{allocs}，reserved{reserveds}")
+        
 
 
 if __name__ == "__main__":
