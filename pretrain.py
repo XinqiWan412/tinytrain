@@ -12,6 +12,7 @@ from config import PretrainExperiment, TrainConfig, DataConfig, load_config
 from torch.nn.parallel import DistributedDataParallel as DDP
 from parallel.dist_utils import all_gather_list, broadcast_params, setup, cleanup, get_rank, get_world_size, all_reduce_mean
 from parallel.zero import ZeroOptimizer
+from parallel.fsdp import load_full_state, shard_model
 
 
 class PretrainTask:
@@ -66,6 +67,8 @@ def train(model: model.ModelForCausalLM,
 
 
 def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig, optimizer_name, zero_stage=0):
+    if optimizer_name == "muon" and zero_stage == 3:
+        raise ValueError("zero_stage=3 暂不支持 muon，请改用 adamw")
     lr, betas, weight_decay = train_config.max_lr, train_config.betas, train_config.weight_decay
     if optimizer_name == "adamw":
         wd, keep = [], []
@@ -106,8 +109,8 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         cls, kwargs = MuonWithAdamW, {}
     else:
         raise ValueError(f"unknown optimizer: {optimizer_name!r}, expected one of: adamw, muon")
-    if zero_stage == 0:
-        # 不做 Zero
+    if zero_stage in (0, 3):
+        # 3 时模型已经分片，参数是 DTensor，普通优化器直接用
         return cls(param_groups, **kwargs)
     elif zero_stage in (1, 2):
         optimizer = ZeroOptimizer(param_groups, cls, stage=zero_stage, **kwargs)
@@ -141,8 +144,12 @@ def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
     ckpt = torch.load(path, map_location=device)
     if ckpt["optimizer_name"] != optimizer_name:
         raise ValueError(f"上次训练使用的优化器是 {ckpt['optimizer_name']}，这次用的是 {optimizer_name}")
-    model.load_state_dict(ckpt["model"])
-    optimizer.load_state_dict(ckpt["optimizer"])
+    if hasattr(model, "set_requires_gradient_sync"):
+        # FSDP2 走这个加载函数
+        load_full_state(model, optimizer, ckpt["model"], ckpt["optimizer"])
+    else:
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
     loader.load_state_dict(ckpt["loader"])
     start_step = ckpt["step"]
     log(f"resume from step {start_step}")
@@ -157,6 +164,9 @@ def main(cfg: PretrainExperiment, resume, device):
 
     m = model.ModelForCausalLM(cfg.model)
     m.to(device)
+    if cfg.parallel.zero_stage == 3 and world_size > 1:
+        m = shard_model(m, device)
+        log("zero_stage=3：已用 fully_shard 分片（每个 Block 一次，最外层一次）")
     optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer, zero_stage=cfg.parallel.zero_stage)
 
     B, T = cfg.data.B, cfg.data.T
@@ -172,7 +182,7 @@ def main(cfg: PretrainExperiment, resume, device):
             # ZeRO-2 不能用 DDP 包
             broadcast_params(m)
             log(f"zero_stage=2：不包 DDP，参数已从 0 号卡广播")
-        else:
+        elif cfg.parallel.zero_stage in (0, 1):
             m = DDP(m, forward_sync_buffers=False)
     # 开始训练
     train(m, optimizer, loader, val_loader, cfg.train, cfg.data, cfg.train.optimizer, cfg.run.ckpt_dir, start_step=start_step, config=cfg)

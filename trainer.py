@@ -3,6 +3,7 @@ from logger import log
 from dataclasses import asdict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from parallel.dist_utils import is_main, all_reduce_mean
+from parallel.fsdp import get_full_state
 
 
 def get_lr(step, train_config):
@@ -38,6 +39,7 @@ class Trainer:
         self.log_formats = getattr(self.task, "log_formats", {})
         self.config = config
         self.is_ddp = isinstance(model, DDP)
+        self.is_fsdp = hasattr(model, "set_requires_gradient_sync")
         self.raw_model = model.module if self.is_ddp else model
 
     def fit(self, start_step=0):
@@ -55,11 +57,13 @@ class Trainer:
             part_extra_acc = {}
             # 前向反向
             for i, part in enumerate(parts):
-                # 只在最后一个 part 做梯度 all-reduce
+                # 只在最后一个 part 同步梯度
                 if self.is_ddp and i < len(parts) - 1:
                     sync_ctx = self.model.no_sync()
                 else:
                     sync_ctx = contextlib.nullcontext()
+                if self.is_fsdp:
+                    self.model.set_requires_gradient_sync(i == len(parts) - 1)
                 with sync_ctx:
                     loss, part_extra = self.task.loss(part)
                     loss.backward()
@@ -86,6 +90,8 @@ class Trainer:
             dt = t1 - t0
             # 记录
             loss_value = loss_accum.item()
+            if hasattr(norm, "full_tensor"):
+                norm = norm.full_tensor()
             norm_value = norm.item()
             extras = {}
             for k, v in {**step_extra, **part_extra_acc}.items():
@@ -118,19 +124,24 @@ class Trainer:
         text = ", ".join(f"{k}:{v:.4f}" for k, v in metrics.items())
         # 打印 log
         log(f"step:{step}, {text}")
+        # 如果设了 ckpt_dir，就保存模型
         if self.ckpt_dir is not None:
-            opt_state = self.optimizer.state_dict()  # ZeRO 时这是集合通信，每个进程都要调用
+            if self.is_fsdp:
+                model_state, opt_state = get_full_state(self.model, self.optimizer)
+            else:
+                model_state = self.raw_model.state_dict()
+                opt_state = self.optimizer.state_dict()  # ZeRO 时这是集合通信，每个进程都要调用
             if is_main():
                 # 存 checkpoint
                 filename = "final.pt" if final else "latest.pt"
-                self._save(os.path.join(self.ckpt_dir, filename), step, metrics, opt_state)
+                self._save(os.path.join(self.ckpt_dir, filename), step, metrics, opt_state, model_state)
         self.model.train()
 
 
-    def _save(self, path, step, metrics, opt_state):
+    def _save(self, path, step, metrics, opt_state, model_state):
         checkpoint = {
             # 用模型需要的
-            "model": self.raw_model.state_dict(),
+            "model": model_state,
             "model_config": asdict(self.raw_model.config),
             # 接着训需要的
             "optimizer": opt_state,

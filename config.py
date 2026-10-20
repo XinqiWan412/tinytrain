@@ -50,7 +50,7 @@ class RunConfig:
 
 @dataclass
 class ParallelConfig:
-    zero_stage: int = 0  # 0 是不切分，1 是 ZeRO-1
+    zero_stage: int = 0  # 0：DDP；1、2：手写ZeRO；3：FSDP2（fully_shard）
 
 
 @dataclass
