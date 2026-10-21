@@ -1,5 +1,9 @@
+from dataclasses import dataclass
 import os, torch
 import torch.distributed as dist
+
+_layout = None
+_tp_group = None
 
 
 def setup():
@@ -69,4 +73,49 @@ def all_gather_list(obj):
         out = [None] * world_size
         dist.all_gather_object(out, obj)
         return out
+
+
+@dataclass(frozen=True)
+class ParallelLayout:
+    tp_rank: int
+    tp_size: int
+    dp_rank: int
+    dp_size: int
+
+
+def compute_layout(rank, world_size, tp_size):
+    if world_size % tp_size != 0:
+        raise ValueError(f"world_size={world_size} 不能被 tp_size={tp_size} 整除")
+    return ParallelLayout(
+        tp_rank=rank % tp_size,
+        tp_size=tp_size,
+        dp_rank=rank // tp_size,
+        dp_size=world_size // tp_size,
+    )
+
+
+def init_parallel(tp_size):
+    global _layout, _tp_group
+    _layout = compute_layout(get_rank(), get_world_size(), tp_size)
+    dp_size = _layout.dp_size
+    if tp_size > 1:
+        for d in range(dp_size):
+            ranks = list(range(d * tp_size, (d + 1) * tp_size))
+            group = dist.new_group(ranks)
+            if get_rank() in ranks:
+                _tp_group = group
+    return _layout
+
+
+def get_layout():
+    if _layout is not None:
+        return _layout
+    else:
+        return compute_layout(get_rank(), get_world_size(), 1)
+
+
+def get_tp_group():
+    if _tp_group is None:
+        raise RuntimeError("先调用 init_parallel，且 tp_size > 1")
+    return _tp_group
 
