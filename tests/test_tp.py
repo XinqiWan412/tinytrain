@@ -1,8 +1,11 @@
 import shutil
-from model import load_model
+from config import TrainConfig
+from model import ModelForCausalLM, load_model
 from parallel.dist_utils import ParallelLayout, compute_layout
 import pytest, os, subprocess, sys, torch
 from pathlib import Path
+
+from pretrain import configure_optimizer
 
 
 def test_compute_layout():
@@ -164,4 +167,12 @@ def test_tp_resume_two(tmp_path, make_data_dir):
     compare_state_dicts(sd1, sd2)
     # 比较 val_loss
     assert ckpt2["val_loss"] == ckpt1["val_loss"]
+
+
+def test_tp_rejects_muon_and_zero(tiny_config):
+    model = ModelForCausalLM(tiny_config)
+    with pytest.raises(ValueError, match="muon"):
+        configure_optimizer(model, TrainConfig(), "muon", tp_size=2)
+    with pytest.raises(ValueError, match="zero_stage"):
+        configure_optimizer(model, TrainConfig(), "adamw", zero_stage=1, tp_size=2)
 

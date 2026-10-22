@@ -17,6 +17,14 @@ torchrun --standalone --nproc_per_node=4 pretrain.py --config configs/adamw_112m
 | 2 | ZeRO-2 | 不包 DDP，开头由 0 号卡广播一次参数 | 同上，另外负责梯度汇总和跨卡求范数 | AdamW、Muon | 同上 |
 | 3 | FSDP2 | fully_shard 分片，不包 DDP | 分片之后再建的原来的优化器 | 只有 AdamW（配 muon 直接报错） | 按参数名存的完整状态，换卡数也能续训 |
 
+张量并行另用 `parallel.tp_size` 打开（默认 1）：
+
+```bash
+torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m/pretrain.toml --set parallel.tp_size=2
+```
+
+这一轮只支持 tp_size=2、卡数等于 tp_size、zero_stage=0、AdamW，不满足时 main 一开头就报错。模型部分存成和单卡相同的格式；优化器状态每卡一项，续训时卡数要相同。
+
 - 卡数要同时整除 8（65,536 ÷ B×T）和 eval_steps（默认 20），所以默认配置下可以用 1、2、4 张；用 8 张卡时要把 eval_steps 改成 8 的倍数，比如 `--set data.eval_steps=24`
 - 加 `--resume` 照样能续训。四种做法存的模型部分都和单卡格式相同，load_model、export_hf、sft.py 能直接读；但 zero_stage 0、1～2、3 这三类存的 checkpoint 不能互相续训，zero_stage=3 存的只能用 zero_stage=3 多卡续训
 - 本地没有多卡时，可以用 CPU 验证多进程的逻辑：`CUDA_VISIBLE_DEVICES= torchrun --standalone --nproc_per_node=2 pretrain.py --config 小配置`，tests/ 里的多进程测试都是这么做的
@@ -31,6 +39,7 @@ torchrun --standalone --nproc_per_node=4 pretrain.py --config configs/adamw_112m
 - 数据按进程跳着读：DataLoader 的 pos 是所有进程共同的位置，读数据时再加上 rank×B×T 的偏移，每批前进 进程数×B×T，所有进程在同一步换片。state_dict 不用改，续训时各进程自动回到自己的位置。这样每一步各进程合起来读的，正是单进程会读的那些 token，平均后的梯度和单进程相同，只差浮点加法顺序
 - 日志里的 loss 和 val_loss 先跨进程平均（all_reduce_mean 先求和再除以卡数，因为 gloo 不支持 AVG）；evaluate 每个进程测 eval_steps ÷ 卡数 批再平均，所以卡数要整除 eval_steps
 - 只有 0 号进程写日志、存 checkpoint，存的是包装前的模型；训练结束时把各卡的峰值显存收集到 0 号进程打印
+- 并行布局：parallel/dist_utils.py 的 compute_layout 算出本卡的 TP、DP 编号和份数（TP 放在编号相邻的卡上），DataLoader 用 DP 编号和份数读数据，只在 DP 份数大于 1 时包 DDP。不开 TP 时 DP 编号就是 rank、份数就是卡数，和原来一样。进程组由 init_parallel 统一建，以后加 PP 只改这里
 
 ### Trainer 里的接入点
 
@@ -40,9 +49,9 @@ Trainer 不认识具体做法，只看模型和优化器有没有某个方法：
 | --- | --- |
 | 梯度累积时，最后一份之前用 no_sync 包住前向和反向 | DDP、ZeRO-1 |
 | 模型有 set_requires_gradient_sync 时，每份之前设一次，只在最后一份打开 | FSDP2 |
-| 优化器有 reduce_grads 就在逐份 backward 之后调用 | ZeRO-2 |
-| 优化器有 clip_grad_norm_ 就用它代替 torch 的 | ZeRO-2（ZeRO-1 里直接调 torch 的） |
-| 存 checkpoint 前，所有进程先一起取优化器状态或完整状态，再由 0 号进程写文件 | ZeRO-1、ZeRO-2、FSDP2 |
+| 优化器有 reduce_grads 就在逐份 backward 之后调用 | ZeRO-2、TP |
+| 优化器有 clip_grad_norm_ 就用它代替 torch 的 | ZeRO-2、TP（ZeRO-1 里直接调 torch 的） |
+| 存 checkpoint 前，所有进程先一起取优化器状态或完整状态，再由 0 号进程写文件 | ZeRO-1、ZeRO-2、FSDP2、TP |
 | 梯度范数是 DTensor 时，记录前先 full_tensor() | FSDP2 |
 
 ## DDP（zero_stage = 0）
@@ -139,6 +148,47 @@ python 单进程与 torchrun 两进程（gloo，CPU）各跑 10 步，final.pt �
 
 FSDP2 把每个矩阵按行切开，step 时每张卡只有几行动量，而 Muon 的正交化要完整矩阵。
 
+## TP（tp_size = 2）
+
+### 做法
+
+- 手写 Megatron 式张量并行：每一层的矩阵乘切成两半，两张卡各存、各算一半，同一个 TP 组的卡读同一批数据
+- 切法。nn.Linear 的权重是（输出, 输入），Megatron 说的"按列切"是按输出切，对应权重的第 0 维：
+
+| 层 | 怎么切 | TP=2 时每卡 | 通信 |
+| --- | --- | --- | --- |
+| q_proj、k_proj、v_proj | 按输出切（ColumnParallelLinear） | 4 个 Q 头、1 个 KV 头 | 前向不用 |
+| o_proj | 按输入切（RowParallelLinear） | 本卡那 4 个头对应的部分 | 输出后 all-reduce |
+| gate_proj、up_proj | 按输出切 | 2304 里的 1152 | 前向不用 |
+| down_proj | 按输入切 | 那 1152 对应的部分 | 输出后 all-reduce |
+| embedding / lm_head、各个 RMSNorm、q_norm、k_norm | 不切，每卡一份完整的 | 全部 | q_norm、k_norm 的梯度要求和，见下 |
+
+- 通信全在 parallel/tp.py 的两个 autograd Function 里：f（CopyToTP）前向原样传、反向把梯度在 TP 组里 all-reduce；g（ReduceFromTP）前向 all-reduce、反向原样传。f 放在按输出切的层的共用输入上（q/k/v 共用一次，gate/up 共用一次），g 放在 RowParallelLinear 的输出上，所以每层前向 2 次、反向 2 次 all-reduce。f 不放进 ColumnParallelLinear：q、k、v 各放一个时结果相同，但反向要做 3 次 all-reduce
+- model.py 不知道 TP：Attention、MLP 入口留了 tp_copy（默认 nn.Identity，不切时计算和 state_dict 都不变）；Attention 按本卡 q_proj、k_proj 的权重形状推出头数。apply_tp 原地把每个 Block 的 7 个线性层换成并行版本、把 tp_copy 换成 f，参数名与单卡相同；按头数（不是维度）检查能否切分
+- GQA 的头正好对得上：q_proj 按行连续切开，0 号卡拿到 Q 头 0～3 和 KV 头 0，而 repeat_interleave 本来就让 Q 头 0～3 共用 KV 头 0，所以每卡上每个 KV 头仍对应 4 个 Q 头
+- 切开的参数打 tp_dim 标记（沿哪一维切），q_norm、k_norm 打 tp_sum_grad 标记，后面的函数都看标记，不认参数名
+- 不切的参数分两种。embedding、lm_head、各层 RMSNorm 处理的是两卡相同的残差流，梯度经过 f 的反向已经加全；q_norm、k_norm 在 f 之后，每张卡都有完整的一份，但只用它处理本卡那几个头，梯度只有一部分。TPOptimizer 包住 AdamW：reduce_grads 把 q_norm、k_norm 的梯度在 TP 组里求和；clip_grad_norm_ 分两类算总范数，切开的参数各卡平方和相加，不切的只算一份
+- 初始化：各进程用同一个种子建出完整模型，再各切各的，初始值和单卡完全一样
+- checkpoint：gather_full_state_dict 按参数名把各卡的参数收集到 0 号进程，切开的沿 tp_dim 拼回，格式和单卡相同，load_model、export_hf、sft.py 能直接读。按名字收集，以后做 PP 时某张卡上没有某些层也照样成立。续训时 load_full_state_dict 按名字从完整权重切出本卡那一块，在切分、建优化器之后调用，main 的顺序不用改
+
+### 正确性标准
+
+两个 worker 在一步之内比较：切开的 MLP、整个小模型与完整版的输出和梯度，拼回、切回，TPOptimizer 的梯度求和、裁剪和一步更新，都在 1e-6 以内或逐位相同。torchrun 1 进程与 2 进程 TP 各跑 10 步，val_loss 相对误差 1e-5，参数 allclose（atol 1e-4），load_model 能读回；中途续训逐位相同；muon 配 tp_size=2、TP 配 ZeRO 时报错。
+
+参数的容差放宽到 1e-4，是因为 TP 改变了前向的加法顺序，AdamW 又会把个别小梯度元素的末位差别放大（约 19 万个元素里只有 1 个超过 1e-5，最大 2.8e-5）。依据和对照组的选法见 [testing.md](testing.md#多进程测试)。
+
+### 踩过的坑
+
+- 去掉 q_norm、k_norm 的梯度求和时，形状全对、loss 照样下降，只有测试能查出来。连续训测试也会失败：两张卡上的 q_norm 各自更新、不再一致，而 checkpoint 只存了 0 号那份。TP 多了一条规矩：不切的参数在各卡上必须一直保持一致
+- 去掉 f 时，单个 MLP 的输出和权重梯度都对，只有输入的梯度错
+- 只按维度检查能否切分不够：k_proj 输出 256 维，tp_size=4 时能整除，但每卡只有半个头
+
+### 这一轮的范围
+
+- 不和 DP、ZeRO、FSDP2 组合：DP 组和 TP 组同时存在时，梯度要分别在各自的组里同步，留到 3D 并行那一轮
+- 不做 Sequence Parallel：残差流上的激活每卡仍是完整的一份，要切它得用 Sequence Parallel，留作可选
+- 不支持 Muon：正交化要完整矩阵，和 FSDP2 同一个原因
+
 ## 待做
 
 - FSDP2 支持 Muon：step 时先把每个矩阵的动量凑齐，再正交化
@@ -149,3 +199,5 @@ FSDP2 把每个矩阵按行切开，step 时每张卡只有几行动量，而 Mu
 
 - TP（张量并行）：q、k、v 和 gate、up 按列切，o 和 down 按行切，按行切之后做一次 all-reduce。模型只有 2 个 KV 头，按头切时 TP 最多切 2 份，再多就要复制 KV 头
 - TP、PP 做完后，按上面同样的小标题（做法、正确性标准、踩过的坑、决定不做的事）补在这里
+- TP 的 GPU 测速（单卡、DDP×2、TP×2，看 tok/s 和每卡显存），等 PP 做完一起上云。预计 TP 在这个模型上比 DDP 慢：每层前向、反向共 4 次 all-reduce，每次传整个激活，而 hidden 只有 768，每卡的计算量又减半，通信占比高
+- 可选：Sequence Parallel；用 PyTorch 自带的 parallelize_module 做 TP 的对照
