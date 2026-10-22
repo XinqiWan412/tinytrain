@@ -169,6 +169,7 @@ def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
 
 def main(cfg: PretrainExperiment, resume, device):
     rank, world_size = get_rank(), get_world_size()
+    # 检查 tp_size, pp_size 的切分度配置
     tp_size = cfg.parallel.tp_size
     if tp_size > 1:
         if cfg.parallel.zero_stage != 0:
@@ -177,7 +178,18 @@ def main(cfg: PretrainExperiment, resume, device):
             raise ValueError(f"这一轮 TP 不和 DP 组合，world_size（{world_size}）必须等于 tp_size（{tp_size}）")
         if cfg.train.optimizer != "adamw":
             raise ValueError("tp_size>1 时只支持 adamw")
-    layout = init_parallel(tp_size)
+    pp_size = cfg.parallel.pp_size
+    if pp_size not in (1, 2):
+        raise ValueError("这一轮 pp 只支持切 2 段")
+    if pp_size > 1:
+        if cfg.parallel.zero_stage != 0:
+            raise ValueError("pp_size > 1 时 zero_stage 必须为 0：这一轮 PP 不和 ZeRO / FSDP2 组合")
+        assert cfg.parallel.zero_stage == 0
+        if tp_size != 1:
+            raise ValueError(f"tp_size 必须为 1")
+        if world_size != tp_size:
+            raise ValueError(f"这一轮 PP 不和 TP, DP 组合，world_size（{world_size}）必须等于 pp_size（{pp_size}）")
+    layout = init_parallel(tp_size, pp_size)
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
     data_dir = cfg.data.data_dir

@@ -52,6 +52,8 @@ class RunConfig:
 class ParallelConfig:
     zero_stage: int = 0  # 0：DDP；1、2：手写ZeRO；3：FSDP2（fully_shard）
     tp_size: int = 1  # 张量并行的份数；1 表示不切
+    pp_size: int = 1  # PP 的段数；1 表示不切
+    pp_first_stage_layers: int = 0  # PP 第一段放几层，0 表示平分
 
 
 @dataclass
