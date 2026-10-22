@@ -4,6 +4,7 @@ from dataclasses import asdict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from parallel.dist_utils import is_main, all_reduce_mean
 from parallel.fsdp import get_full_state
+from parallel.tp import gather_full_state_dict, is_tp_model
 
 
 def get_lr(step, train_config):
@@ -41,6 +42,7 @@ class Trainer:
         self.is_ddp = isinstance(model, DDP)
         self.is_fsdp = hasattr(model, "set_requires_gradient_sync")
         self.raw_model = model.module if self.is_ddp else model
+        self.is_tp = is_tp_model(self.raw_model)
 
     def fit(self, start_step=0):
         records = collections.defaultdict(list)  # 记录返回值
@@ -128,6 +130,9 @@ class Trainer:
         if self.ckpt_dir is not None:
             if self.is_fsdp:
                 model_state, opt_state = get_full_state(self.model, self.optimizer)
+            elif self.is_tp:
+                model_state = gather_full_state_dict(self.raw_model)
+                opt_state = self.optimizer.state_dict()
             else:
                 model_state = self.raw_model.state_dict()
                 opt_state = self.optimizer.state_dict()  # ZeRO 时这是集合通信，每个进程都要调用

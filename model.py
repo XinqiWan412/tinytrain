@@ -67,12 +67,15 @@ class Attention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads*self.head_dim, self.hidden_size, bias=False)  # (H*dh, D)
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # (dh,)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # (dh,)
+        self.tp_copy = nn.Identity()
     
     def forward(self, x, cos, sin):
         # x 是 (B, T, D)
         B, T, _ = x.shape
-        H, H_kv, dh = self.num_heads, self.num_kv_heads, self.head_dim
+        dh = self.head_dim
+        H, H_kv = self.q_proj.weight.shape[0] // dh, self.k_proj.weight.shape[0] // dh
         g = H // H_kv
+        x = self.tp_copy(x)  # 用 f 包一下 x，反向的时候才会做 TP 的规约
         q = self.q_proj(x).view(B, T, H, dh)  # (B, T, H, dh)
         k = self.k_proj(x).view(B, T, H_kv, dh)  # (B, T, H_kv, dh)
         v = self.v_proj(x).view(B, T, H_kv, dh)  # (B, T, H_kv, dh)
@@ -97,8 +100,10 @@ class MLP(nn.Module):
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)  # D -> intermediate
         self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)  # D -> intermediate
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)  # intermediate -> D
+        self.tp_copy = nn.Identity()
     
     def forward(self, x):
+        x = self.tp_copy(x)  # 用 f 包一下 x，反向的时候才会做 TP 的规约
         gate = self.gate_proj(x)  # (B, T, intermediate)
         up = self.up_proj(x)  # (B, T, intermediate)
         silu_gate = F.silu(gate)  # (B, T, intermediate)

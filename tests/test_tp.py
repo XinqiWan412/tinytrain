@@ -45,3 +45,12 @@ def test_tp_mlp_matches_full():
     assert "rank 0 OK" in result.stdout
     assert "rank 1 OK" in result.stdout
 
+
+def test_tp_model_matches_full():
+    path = Path(__file__).parent / "tp_model_worker.py"
+    cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone",
+    "--nproc_per_node=2", str(path)]
+    result = run_subprocess(cmd)
+    assert "rank 0 OK" in result.stdout
+    assert "rank 1 OK" in result.stdout
+

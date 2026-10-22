@@ -51,6 +51,7 @@ class RunConfig:
 @dataclass
 class ParallelConfig:
     zero_stage: int = 0  # 0：DDP；1、2：手写ZeRO；3：FSDP2（fully_shard）
+    tp_size: int = 1  # 张量并行的份数；1 表示不切
 
 
 @dataclass

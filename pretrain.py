@@ -7,10 +7,11 @@ import os
 import argparse
 from logger import log, setup_log
 from muon import MuonWithAdamW
+from parallel.tp import TPOptimizer, apply_tp, is_tp_model, load_full_state_dict
 from trainer import Trainer
 from config import PretrainExperiment, TrainConfig, DataConfig, load_config
 from torch.nn.parallel import DistributedDataParallel as DDP
-from parallel.dist_utils import all_gather_list, broadcast_params, setup, cleanup, get_rank, get_world_size, all_reduce_mean
+from parallel.dist_utils import all_gather_list, broadcast_params, init_parallel, setup, cleanup, get_rank, get_world_size, all_reduce_mean
 from parallel.zero import ZeroOptimizer
 from parallel.fsdp import load_full_state, shard_model
 
@@ -66,9 +67,13 @@ def train(model: model.ModelForCausalLM,
     return records["loss"], records["norm"]
 
 
-def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig, optimizer_name, zero_stage=0):
+def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig, optimizer_name, zero_stage=0, tp_size=1):
     if optimizer_name == "muon" and zero_stage == 3:
         raise ValueError("zero_stage=3 暂不支持 muon，请改用 adamw")
+    if optimizer_name == "muon" and tp_size > 1:
+        raise ValueError("tp 暂不支持 muon，请改用 adamw")
+    if tp_size > 1 and zero_stage != 0:
+        raise ValueError("这一轮 TP 不和 ZeRO / FSDP2 组合：tp_size>1 时 zero_stage 必须为 0")
     lr, betas, weight_decay = train_config.max_lr, train_config.betas, train_config.weight_decay
     if optimizer_name == "adamw":
         wd, keep = [], []
@@ -109,6 +114,8 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         cls, kwargs = MuonWithAdamW, {}
     else:
         raise ValueError(f"unknown optimizer: {optimizer_name!r}, expected one of: adamw, muon")
+    if tp_size > 1:
+        return TPOptimizer(param_groups, cls, **kwargs)
     if zero_stage in (0, 3):
         # 3 时模型已经分片，参数是 DTensor，普通优化器直接用
         return cls(param_groups, **kwargs)
@@ -117,7 +124,7 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         log(f"optimizer.world_size:{optimizer.world_size}, optimizer.numel_per_rank:{optimizer.numel_per_rank}, zero_stage:{zero_stage}")
         return optimizer
     else:
-        raise ValueError(f"zero_stage 只支持 0、1、2，收到 {zero_stage!r}")
+        raise ValueError(f"zero_stage 只支持 0、1、2、3，收到 {zero_stage!r}")
 
 
 def evaluate(model, val_loader: dataloader.DataLoader, data_config: DataConfig):
@@ -147,6 +154,10 @@ def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
     if hasattr(model, "set_requires_gradient_sync"):
         # FSDP2 走这个加载函数
         load_full_state(model, optimizer, ckpt["model"], ckpt["optimizer"])
+    elif is_tp_model(model):
+        # tp 走这里
+        load_full_state_dict(model, ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
     else:
         model.load_state_dict(ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -158,26 +169,38 @@ def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
 
 def main(cfg: PretrainExperiment, resume, device):
     rank, world_size = get_rank(), get_world_size()
+    tp_size = cfg.parallel.tp_size
+    if tp_size > 1:
+        if cfg.parallel.zero_stage != 0:
+            raise ValueError("tp_size>1 时 zero_stage 必须为 0：这一轮 TP 不和 ZeRO / FSDP2 组合")
+        if world_size != tp_size:
+            raise ValueError(f"这一轮 TP 不和 DP 组合，world_size（{world_size}）必须等于 tp_size（{tp_size}）")
+        if cfg.train.optimizer != "adamw":
+            raise ValueError("tp_size>1 时只支持 adamw")
+    layout = init_parallel(tp_size)
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
     data_dir = cfg.data.data_dir
 
     m = model.ModelForCausalLM(cfg.model)
     m.to(device)
+    if tp_size > 1:
+        m = apply_tp(m)
+        log(f"tp_size={layout.tp_size}: model 已切分")
     if cfg.parallel.zero_stage == 3 and world_size > 1:
         m = shard_model(m, device)
         log("zero_stage=3：已用 fully_shard 分片（每个 Block 一次，最外层一次）")
-    optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer, zero_stage=cfg.parallel.zero_stage)
+    optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer, zero_stage=cfg.parallel.zero_stage, tp_size=layout.tp_size)
 
     B, T = cfg.data.B, cfg.data.T
-    loader = dataloader.DataLoader(data_dir, 'train', B, T, device, rank=rank, world_size=world_size)
-    val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device, rank=rank, world_size=world_size)
+    loader = dataloader.DataLoader(data_dir, 'train', B, T, device, rank=layout.dp_rank, world_size=layout.dp_size)
+    val_loader = dataloader.DataLoader(data_dir, 'val', B, T, device, rank=layout.dp_rank, world_size=layout.dp_size)
     start_step = 0
     if resume:
         # 断点续训，读取训练中断前的模型、优化器、train loader 的 state_dict
         path = os.path.join(cfg.run.ckpt_dir, "latest.pt")
         start_step = load_checkpoint(path, m, optimizer, cfg.train.optimizer, loader, device)
-    if world_size > 1:
+    if layout.dp_size > 1:
         if cfg.parallel.zero_stage == 2:
             # ZeRO-2 不能用 DDP 包
             broadcast_params(m)
