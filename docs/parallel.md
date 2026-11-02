@@ -25,10 +25,25 @@ torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m
 
 这一轮只支持 tp_size=2、卡数等于 tp_size、zero_stage=0、AdamW，不满足时 main 一开头就报错。模型部分存成和单卡相同的格式；优化器状态每卡一项，续训时卡数要相同。
 
+流水线并行用 `parallel.pp_size` 打开（默认 1）：
+
+```bash
+torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m/pretrain.toml --set parallel.pp_size=2 --set parallel.pp_first_stage_layers=7
+```
+
+这一轮只支持 pp_size=2、卡数等于 pp_size、tp_size=1、zero_stage=0，AdamW、Muon 都支持，不满足时 main 一开头就报错。另外两个选项：
+
+- `parallel.pp_first_stage_layers`：第一段放几层，默认 0 表示平分。这个模型 7/5 最快，见 [results.md](results.md)
+- `parallel.pp_schedule`：`1f1b`（默认）或 `gpipe`，两者训练结果逐位相同，1F1B 更省显存
+
+模型部分存成和单卡相同的格式；优化器状态每卡一项，续训时卡数和切点都要相同。
+
 - 卡数要同时整除 8（65,536 ÷ B×T）和 eval_steps（默认 20），所以默认配置下可以用 1、2、4 张；用 8 张卡时要把 eval_steps 改成 8 的倍数，比如 `--set data.eval_steps=24`
 - 加 `--resume` 照样能续训。四种做法存的模型部分都和单卡格式相同，load_model、export_hf、sft.py 能直接读；但 zero_stage 0、1～2、3 这三类存的 checkpoint 不能互相续训，zero_stage=3 存的只能用 zero_stage=3 多卡续训
 - 本地没有多卡时，可以用 CPU 验证多进程的逻辑：`CUDA_VISIBLE_DEVICES= torchrun --standalone --nproc_per_node=2 pretrain.py --config 小配置`，tests/ 里的多进程测试都是这么做的
 - 复现 results.md 里的测速：加 `--set train.max_steps=300`，并用 `--set run.ckpt_dir=…`、`--set run.log=…` 指到临时目录；单卡那次用 python 启动，命令前加 `CUDA_VISIBLE_DEVICES=0`。前 300 步只用到第一片训练数据，云上只需传 train_000000.bin、val_000000.bin 和 meta.json
+
+
 
 ## 公共部分
 
@@ -39,7 +54,7 @@ torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m
 - 数据按进程跳着读：DataLoader 的 pos 是所有进程共同的位置，读数据时再加上 rank×B×T 的偏移，每批前进 进程数×B×T，所有进程在同一步换片。state_dict 不用改，续训时各进程自动回到自己的位置。这样每一步各进程合起来读的，正是单进程会读的那些 token，平均后的梯度和单进程相同，只差浮点加法顺序
 - 日志里的 loss 和 val_loss 先跨进程平均（all_reduce_mean 先求和再除以卡数，因为 gloo 不支持 AVG）；evaluate 每个进程测 eval_steps ÷ 卡数 批再平均，所以卡数要整除 eval_steps
 - 只有 0 号进程写日志、存 checkpoint，存的是包装前的模型；训练结束时把各卡的峰值显存收集到 0 号进程打印
-- 并行布局：parallel/dist_utils.py 的 compute_layout 算出本卡的 TP、DP 编号和份数（TP 放在编号相邻的卡上），DataLoader 用 DP 编号和份数读数据，只在 DP 份数大于 1 时包 DDP。不开 TP 时 DP 编号就是 rank、份数就是卡数，和原来一样。进程组由 init_parallel 统一建，以后加 PP 只改这里
+- 并行布局：parallel/dist_utils.py 的 compute_layout 算出本卡的 TP、DP、PP 编号和份数，按 Megatron 的惯例 TP 变化最快（放在编号相邻的卡上）、PP 变化最慢；DataLoader 用 DP 编号和份数读数据，只在 DP 份数大于 1 时包 DDP。不开 TP、PP 时 DP 编号就是 rank、份数就是卡数，和原来一样。进程组都由 init_parallel 建：TP 组是编号相邻的 tp_size 张卡；pp_group_ranks 从布局推出 PP 组（tp、dp 编号都相同的卡归成一条流水线），每条流水线的首尾两段再组成 embedding 组。每个进程要对每个组都调用 new_group，自己不在的组也要调
 
 ### Trainer 里的接入点
 
@@ -49,9 +64,10 @@ Trainer 不认识具体做法，只看模型和优化器有没有某个方法：
 | --- | --- |
 | 梯度累积时，最后一份之前用 no_sync 包住前向和反向 | DDP、ZeRO-1 |
 | 模型有 set_requires_gradient_sync 时，每份之前设一次，只在最后一份打开 | FSDP2 |
-| 优化器有 reduce_grads 就在逐份 backward 之后调用 | ZeRO-2、TP |
-| 优化器有 clip_grad_norm_ 就用它代替 torch 的 | ZeRO-2、TP（ZeRO-1 里直接调 torch 的） |
-| 存 checkpoint 前，所有进程先一起取优化器状态或完整状态，再由 0 号进程写文件 | ZeRO-1、ZeRO-2、FSDP2、TP |
+| 模型是 PP 模型（有 pp_stage）时，用 pp_schedule 选出的调度函数代替逐份的前向反向，再把最后一段的 loss 在 PP 组里广播；evaluate 改用 pp_forward | PP |
+| 优化器有 reduce_grads 就在逐份 backward 之后调用 | ZeRO-2、TP、PP |
+| 优化器有 clip_grad_norm_ 就用它代替 torch 的 | ZeRO-2、TP、PP（ZeRO-1 里直接调 torch 的） |
+| 存 checkpoint 前，所有进程先一起取优化器状态或完整状态，再由 0 号进程写文件 | ZeRO-1、ZeRO-2、FSDP2、TP、PP |
 | 梯度范数是 DTensor 时，记录前先 full_tensor() | FSDP2 |
 
 ## DDP（zero_stage = 0）
@@ -183,11 +199,59 @@ FSDP2 把每个矩阵按行切开，step 时每张卡只有几行动量，而 Mu
 - 去掉 f 时，单个 MLP 的输出和权重梯度都对，只有输入的梯度错
 - 只按维度检查能否切分不够：k_proj 输出 256 维，tp_size=4 时能整除，但每卡只有半个头
 
+### 测速
+
+2×A100（NVLink）上每步 622 ms，只比单卡（688 ms）快 11%，比 DDP×2（352 ms）慢得多，和做之前的预计一致：lm_head、loss 和各层的小操作两张卡各算一遍，每份数据 48 次 all-reduce 又没和计算重叠。见 [results.md](results.md)。
+
 ### 这一轮的范围
 
 - 不和 DP、ZeRO、FSDP2 组合：DP 组和 TP 组同时存在时，梯度要分别在各自的组里同步，留到 3D 并行那一轮
 - 不做 Sequence Parallel：残差流上的激活每卡仍是完整的一份，要切它得用 Sequence Parallel，留作可选
 - 不支持 Muon：正交化要完整矩阵，和 FSDP2 同一个原因
+
+## PP（pp_size = 2）
+
+### 做法
+
+- 手写流水线并行：不切矩阵，切层。12 层分成两段，卡 0 放 embedding 和前 k 层，卡 1 放后 12−k 层、norm、lm_head 和 loss。一步里梯度累积的 8 份就是 8 个 micro-batch，依次流过两段。两段之间只在交界处传东西：前向传激活，反向传激活的梯度，形状 (B, T, 768)、fp32（autocast 下残差流仍是 fp32），每份每个方向约 25 MB
+- 切分：每张卡用同一个种子建出完整模型，split_model 再把不属于本段的层、第一段的 norm 和 lm_head、第二段的 embed_tokens 换成没有参数的 nn.Identity。层名保持全局编号（第二段仍是 layers.6～11），所以 TP 那轮按名字拼回、切回 checkpoint 的函数可以直接用，load_full_state_dict 只多允许了一件事：PP 时 checkpoint 里有本段之外的键。在 .to(device) 之前切，每张卡只把自己那段搬上 GPU
+- model.py 不知道 PP：两段的前向 forward_first、forward_last 写在 parallel/pp.py，照抄完整模型的前向，只遍历本段的层
+- 两种调度：
+
+| 调度 | 顺序 | 第一段同时存几份激活 |
+| --- | --- | --- |
+| GPipe | 8 份的前向全做完，再做反向 | 8 |
+| 1F1B（默认） | 先灌满，再一前一后交替，最后排空 | 最多 2 |
+
+  两种调度的反向都按第 0～7 份的顺序做，梯度累加顺序和单卡相同，所以结果逐位相同；气泡都是（段数−1）÷（份数＋段数−1）＝ 1/9
+- 收发：send、recv 用默认组，对方的全局编号由 PP 组换算（dist.get_global_rank）。GPipe 任何时候只有一个方向在传，用阻塞的 send/recv 就够了；1F1B 交替时两段会同时给对方发东西，用 batch_isend_irecv 把"一发一收"打包提交。只把 send 换成 isend，在 NCCL 上仍可能互相等住
+- 共享的 embedding / lm_head：两段各存一份（第二段上它叫 lm_head.weight），都打 pp_shared 标记。PPOptimizer 包住原来的优化器：reduce_grads 在 embedding 组里把两份梯度相加，让两份一直相同；clip_grad_norm_ 把各段的平方和在 PP 组里相加，共享参数只在第一段算一次。Muon 路线分组时，除了按名字认 embed_tokens，还要认 pp_shared，否则第二段的 lm_head.weight 会被分进 Muon 组
+- loss：只有最后一段算得出 loss。broadcast_from_last 在 PP 组里把它广播出去，之后照常 all_reduce_mean：各卡的数值相同，平均后不变，到 3D 时正好在各份 DP 之间求平均。evaluate 用只做前向的 pp_forward，val_loss 同样广播后写进 checkpoint
+- 数据：同一条流水线上的两段读同一批数据，第一段用输入、第二段用目标；DataLoader 照旧按 DP 编号读，这一轮 DP 只有 1 份
+
+### 正确性标准
+
+- 单进程里切出两段，用 detach().requires_grad_() 模拟交接，再用 h.backward(收到的梯度) 接着反向：两段前向的 loss、各参数梯度都与完整模型逐位相同，共享参数两段之和也逐位相同
+- pp_worker 两进程 4 份数据：GPipe 与完整模型逐位相同（共享参数除外）；1F1B 与 GPipe 的各参数梯度（含共享参数）和 loss 逐位相同
+- torchrun 1 进程与 PP 2 进程各跑 10 步：参数 allclose，AdamW 1e-5、Muon 1e-4，val_loss 用同样的相对容差，load_model 能读回；GPipe 与 1F1B 的完整训练逐位相同；中途续训逐位相同
+
+和单卡只能 allclose，是因为共享参数梯度的加法分组变了：单卡时每份数据的 embedding 梯度和 lm_head 梯度在反向里先合在一起，是 (e0+l0)+(e1+l1)+…；PP 是两段各自累加完再相加，是 (e0+…+e7)+(l0+…+l7)。只有一份数据时只是 a+b 和 b+a 的区别，结果完全相同。只有这一处变了，所以 AdamW 不用像 TP 那样放宽到 1e-4。
+
+### 踩过的坑
+
+- 一处 recv 指定了 PP 组，对面却在默认组上发，测试卡死。进程组相当于不同的频道，发和收必须在同一个组上
+- 第二段的共享参数叫 lm_head.weight，Muon 按名字分组会把它分进 Muon 组：第一段用 AdamW、第二段用 Muon 更新同一个参数，从第 1 步起两份就不一样了；而且要对 768×32768 的矩阵做正交化，CPU 小模型上每步从约 80 ms 变成约 350 ms
+- 第一段如果留着 norm，它永远拿不到梯度、也不会更新，存 checkpoint 时又和第二段的同名参数撞名，最后存下的是谁全看收集顺序。所以不属于本段的部分必须换成占位
+- 不广播 loss 时，0 号卡在第一段，日志里的 loss 是第一段的 0 和真实 loss 的平均，只剩一半
+- 本地测试都在 CPU 上跑，autocast 不生效，测不到 GPU 上发过来的激活是不是 fp32、和第二段准备的缓冲区对不对得上；上云前先在单卡 GPU 上确认了 forward_first 在 autocast 下输出 fp32。同样，gloo 对小消息可能先缓冲，1F1B 就算写成阻塞收发，在 CPU 上也不一定卡住，这一点只能靠分析
+- 切点：起初按参数个数估计 lm_head 约等于 3.5 层，实测只相当于约 1.8 层，8/4 反而比 6/6 慢，见 [results.md](results.md)
+
+### 这一轮的范围
+
+- 只做预训练，只切 2 段（pp_size 只能是 1 或 2）
+- 不和 DP、TP、ZeRO、FSDP2 组合，留到 3D 并行
+- 不做 interleaved 1F1B（每张卡放几段不相邻的层，用来缩小气泡）和 zero-bubble 一类的调度
+- 默认切点仍是平分，没有改成 7/5：最快的切点和模型、卡型都有关，作为测速结论写在 results.md 里
 
 ## 待做
 
@@ -195,9 +259,9 @@ FSDP2 把每个矩阵按行切开，step 时每张卡只有几行动量，而 Mu
 - 查 AdamW 路线下 ZeRO-1 的 3 号卡多出的约 440 MiB（用显存快照）
 - 可选：FSDP2 的 MixedPrecisionPolicy，参数以 bf16 收集，这一步的通信量减半，但数值和 autocast 不完全一样，作为单独的实验
 
-## 下一步：TP，之后 PP
+## 下一步：3D 并行
 
-- TP（张量并行）：q、k、v 和 gate、up 按列切，o 和 down 按行切，按行切之后做一次 all-reduce。模型只有 2 个 KV 头，按头切时 TP 最多切 2 份，再多就要复制 KV 头
-- TP、PP 做完后，按上面同样的小标题（做法、正确性标准、踩过的坑、决定不做的事）补在这里
-- TP 的 GPU 测速（单卡、DDP×2、TP×2，看 tok/s 和每卡显存），等 PP 做完一起上云。预计 TP 在这个模型上比 DDP 慢：每层前向、反向共 4 次 all-reduce，每次传整个激活，而 hidden 只有 768，每卡的计算量又减半，通信占比高
-- 可选：Sequence Parallel；用 PyTorch 自带的 parallelize_module 做 TP 的对照
+- 单机 8 卡组成 DP2×TP2×PP2，每张卡同时属于一个 DP 组、一个 TP 组、一个 PP 组，几种通信各走各的组：DDP 只在 DP 组里同步梯度（包 DDP 时传入 DP 组），TP 的 all-reduce 在 TP 组里，激活的收发在 PP 组里，共享参数的梯度在每条流水线自己的 embedding 组里求和
+- 已经铺好的部分：compute_layout 能算三种编号；init_parallel 的 TP 组按全部 world_size ÷ tp_size 个建，PP 组和 embedding 组由布局推出。还要补的是 DP 组
+- 要合并的部分：TPOptimizer 和 PPOptimizer 合成一个，梯度求和、裁剪时的平方和各在自己的组里做。loss 广播之后的 all_reduce_mean 不用改，在全体卡上平均正好就是各份 DP 的平均
+- 可选：interleaved 1F1B；用 PyTorch 自带的 parallelize_module、torch.distributed.pipelining 做对照

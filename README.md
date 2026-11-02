@@ -2,7 +2,7 @@
 
 从零手写的 LLM 训练全流程：预训练 → SFT → GRPO。模型结构参考 Qwen3-0.6B，模型、数据加载、训练循环、对话模板、GRPO 都是自己实现的，没有用 transformers / trl。
 
-在单张 RTX 4070 Ti Super（16GB）上先用 1150 万参数的小模型跑通全流程，再扩大到 1.12 亿参数，对比 AdamW 和 Muon 两种优化器；导出 HF 格式后与 transformers 对拍；预训练支持 DDP、手写的 ZeRO-1 / ZeRO-2 和 FSDP2（fully_shard），在 4×RTX 4090 和 4×A100 上测过；手写的张量并行（TP=2）已在 CPU 上验证，GPU 测速待做。
+在单张 RTX 4070 Ti Super（16GB）上先用 1150 万参数的小模型跑通全流程，再扩大到 1.12 亿参数，对比 AdamW 和 Muon 两种优化器；导出 HF 格式后与 transformers 对拍；预训练支持 DDP、手写的 ZeRO-1 / ZeRO-2、FSDP2（fully_shard），以及手写的张量并行（TP=2）和流水线并行（PP=2，GPipe / 1F1B），在 4×RTX 4090、4×A100 和 2×A100 上测过。
 
 ## 结果
 
@@ -31,6 +31,19 @@
 - 显存按参数、梯度、优化器状态逐项与预计对得上。FSDP2 每卡比 DDP 少约 1.3 GB；这个模型的显存大头是激活和 logits（约 8.2 GB），模型状态只占约 1.7 GB，所以省得不多
 - ZeRO-1 的 3 号卡比其余三张多约 440 MiB，原因待查
 - 另外两组对比：卡间不支持 P2P 的 4×RTX 4090 上，DDP 的扩展效率只有 55%，瓶颈是梯度通信；Muon 路线下 ZeRO-1 比 DDP 还快（92% vs 84%），因为 Muon 的正交化被分摊到了各卡
+
+### 多卡：2×A100（NVLink），TP 与 PP，AdamW 路线前 300 步
+
+|  | 单卡 | DDP | TP | PP GPipe 6/6 | PP 1F1B 6/6 | PP 1F1B 7/5 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 每步时间 | 688 ms | 352 ms | 622 ms | 430 ms | 434 ms | 406 ms |
+| 扩展效率 | — | 98% | 55% | 80% | 79% | 85% |
+| 峰值显存 allocated（0 号 / 1 号卡） | 9,959 MiB | 10,396 MiB | 7,462 MiB | 23,261 / 37,130 MiB | 6,768 / 6,511 MiB | 7,808 / 5,942 MiB |
+
+- 6/6 指第一段 6 层、第二段 6 层；另测了 8/4，见 results.md。所有组的 val loss 相差不到 5e-4
+- 这个模型单卡放得下，2 卡时 DDP 最好。PP 慢在 1/9 的气泡和两段不均衡，通信可以忽略。按参数个数估，lm_head 约等于 3.5 层，实测只相当于约 1.8 层，所以 8/4 反而比 6/6 慢；7/5 最快，接近只剩气泡时的上限（约 387 ms）
+- 1F1B 与 GPipe 速度相同、训练结果逐位相同，显存却低得多：GPipe 要同时存 8 份激活，第二段每份还要多存约 1.7 GB 的 logits 等中间结果
+- TP 只快 11%：lm_head、loss 和各层的小操作两张卡各算一遍，每份数据 48 次 all-reduce 又没和计算重叠
 
 各版本的完整表格和分析见 [docs/results.md](docs/results.md)，多卡各做法的实现见 [docs/parallel.md](docs/parallel.md)。
 
@@ -63,16 +76,17 @@ python grpo.py --config configs/adamw_112m/grpo.toml
 # 7. 导出 HF 格式并对拍；--gen 再比较贪心生成，只用于 SFT / GRPO 模型
 python export_hf.py --ckpt checkpoints/adamw_112m/sft.pt --out hf/adamw_112m/sft --gen
 
-# 8. 多卡预训练（单机）：默认 DDP；--set parallel.zero_stage=1 / 2 为 ZeRO-1 / ZeRO-2，=3 为 FSDP2（只支持 AdamW）；TP 见第二行（2 卡、只支持 AdamW）
+# 8. 多卡预训练（单机）：默认 DDP；--set parallel.zero_stage=1 / 2 为 ZeRO-1 / ZeRO-2，=3 为 FSDP2（只支持 AdamW）；第二行是 TP（2 卡、只支持 AdamW），第三行是 PP（2 卡，按 7/5 切分）
 torchrun --standalone --nproc_per_node=4 pretrain.py --config configs/adamw_112m/pretrain.toml
 torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m/pretrain.toml --set parallel.tp_size=2
+torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m/pretrain.toml --set parallel.pp_size=2 --set parallel.pp_first_stage_layers=7
 ```
 
 - Muon 路线把路径里的 adamw_112m 换成 muon_112m
 - 每次运行的参数都在 configs/ 的配置文件里；临时改参数用 `--set 节.键=值`（可写多次），完整配置会打在日志开头并存进 checkpoint
 - 多卡的卡数限制、续训规则、在 CPU 上验证多进程的方法见 [docs/parallel.md](docs/parallel.md)
 
-测试：`pytest -v` 跑 65 个快测试（CPU，约 120 秒，不需要数据），`pytest -m slow -v` 跑 2 个需要原始数据的慢测试。测试怎么设计、临时改坏能被哪些测试抓到，见 [docs/testing.md](docs/testing.md)。
+测试：`pytest -v` 跑 76 个快测试（CPU，约 150 秒，不需要数据），`pytest -m slow -v` 跑 2 个需要原始数据的慢测试。测试怎么设计、临时改坏能被哪些测试抓到，见 [docs/testing.md](docs/testing.md)。
 
 ## 项目结构
 
@@ -93,10 +107,11 @@ torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m
 - `config.py`：配置 dataclass 和 load_config（TOML + `--set`）
 - `logger.py`：日志同时打印并写文件，多进程时只有 0 号进程输出
 - `parallel/`
-  - `dist_utils.py`：进程组初始化、并行布局（本卡的 DP、TP 编号）和通信小工具
+  - `dist_utils.py`：进程组初始化、并行布局（本卡的 DP、TP、PP 编号）和通信小工具
   - `zero.py`：手写 ZeRO-1 / ZeRO-2（ZeroOptimizer）
   - `fsdp.py`：FSDP2 分片，以及完整状态的收集和读回
-  - `tp.py`：tp.py：手写张量并行（f / g、两种并行线性层、apply_tp、TPOptimizer、按参数名拼回和切回）
+  - `tp.py`：手写张量并行（f / g、两种并行线性层、apply_tp、TPOptimizer、按参数名拼回和切回）
+  - `pp.py`：手写流水线并行（按段切分模型、两段的前向、GPipe 和 1F1B 调度、PPOptimizer）
 - `configs/`：adamw_112m、muon_112m 两条路线，各 4 个配置文件（pretrain、sft、sft_weak、grpo）
 - `tests/`：pytest 测试，见 [docs/testing.md](docs/testing.md)
 
@@ -114,8 +129,8 @@ torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m
 | v0.6 | DDP |
 | v0.7 | 手写 ZeRO-1 / ZeRO-2 |
 | v0.8 | FSDP2（fully_shard） |
-| 进行中 | 手写 TP：代码和测试已完成，GPU 测速等 PP 做完一起 |
-| 下一步 | PP → 3D 并行（DP×TP×PP） |
+| v0.9 | 手写 TP（张量并行）和 PP（流水线并行，GPipe / 1F1B） |
+| 下一步 | 3D 并行（DP×TP×PP） |
 | 之后 | 性能优化（MFU、torch.profiler、torch.compile、自写 Triton FlashAttention、分块 lm_head + CE、activation checkpointing）→ 序列打包 + varlen attention → 推理框架（KV cache、批量调度，接入 GRPO rollout，与 vLLM 对照） |
 
 可选：零样本 benchmark（如 HellaSwag）、两种优化器扫 lr 与 GRPO 多种子、PPO 式 ratio + clip / DAPO、更多题型、MoE、GitHub Actions CI、FSDP2 的 MixedPrecisionPolicy。
