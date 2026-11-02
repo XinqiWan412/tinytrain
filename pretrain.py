@@ -7,6 +7,7 @@ import os
 import argparse
 from logger import log, setup_log
 from muon import MuonWithAdamW
+from parallel.pp import PPOptimizer, broadcast_from_last, is_pp_model, pp_forward, split_model
 from parallel.tp import TPOptimizer, apply_tp, is_tp_model, load_full_state_dict
 from trainer import Trainer
 from config import PretrainExperiment, TrainConfig, DataConfig, load_config
@@ -67,7 +68,7 @@ def train(model: model.ModelForCausalLM,
     return records["loss"], records["norm"]
 
 
-def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig, optimizer_name, zero_stage=0, tp_size=1):
+def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig, optimizer_name, zero_stage=0, tp_size=1, pp_size=1):
     if optimizer_name == "muon" and zero_stage == 3:
         raise ValueError("zero_stage=3 暂不支持 muon，请改用 adamw")
     if optimizer_name == "muon" and tp_size > 1:
@@ -96,7 +97,7 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         for name, p in model.named_parameters():
             if len(p.shape) == 1:
                 keep.append(p)
-            elif "embed_tokens" in name:
+            elif "embed_tokens" in name or getattr(p, "pp_shared", False):
                 wd.append(p)
             else:
                 muon_params.append(p)
@@ -116,6 +117,8 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         raise ValueError(f"unknown optimizer: {optimizer_name!r}, expected one of: adamw, muon")
     if tp_size > 1:
         return TPOptimizer(param_groups, cls, **kwargs)
+    if pp_size > 1:
+        return PPOptimizer(param_groups, cls, **kwargs)
     if zero_stage in (0, 3):
         # 3 时模型已经分片，参数是 DTensor，普通优化器直接用
         return cls(param_groups, **kwargs)
@@ -128,6 +131,7 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
 
 
 def evaluate(model, val_loader: dataloader.DataLoader, data_config: DataConfig):
+    is_pp = is_pp_model(model)
     model.eval()
     val_loader.reset()
     eval_steps = data_config.eval_steps
@@ -139,9 +143,16 @@ def evaluate(model, val_loader: dataloader.DataLoader, data_config: DataConfig):
         x, y = val_loader.next_batch()
         with torch.no_grad():
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                _, loss = model(x, y)
-        loss_accum += loss.detach()
+                if is_pp:
+                    loss = pp_forward(model, x, y)
+                else:
+                    _, loss = model(x, y)
+        if loss is not None:
+            # pp 第一段拿到的 loss 是 None
+            loss_accum += loss.detach()
     loss_avg = loss_accum / per_rank_eval_steps
+    if is_pp:
+        loss_avg = broadcast_from_last(model, loss_avg)
     model.train()
     loss_avg = all_reduce_mean(loss_avg)
     return loss_avg.item()
@@ -154,7 +165,7 @@ def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
     if hasattr(model, "set_requires_gradient_sync"):
         # FSDP2 走这个加载函数
         load_full_state(model, optimizer, ckpt["model"], ckpt["optimizer"])
-    elif is_tp_model(model):
+    elif is_tp_model(model) or is_pp_model(model):
         # tp 走这里
         load_full_state_dict(model, ckpt["model"])
         optimizer.load_state_dict(ckpt["optimizer"])
@@ -184,10 +195,9 @@ def main(cfg: PretrainExperiment, resume, device):
     if pp_size > 1:
         if cfg.parallel.zero_stage != 0:
             raise ValueError("pp_size > 1 时 zero_stage 必须为 0：这一轮 PP 不和 ZeRO / FSDP2 组合")
-        assert cfg.parallel.zero_stage == 0
         if tp_size != 1:
-            raise ValueError(f"tp_size 必须为 1")
-        if world_size != tp_size:
+            raise ValueError(f"这一轮 PP 不和 TP 组合：pp_size>1 时 tp_size 必须为 1")
+        if world_size != pp_size:
             raise ValueError(f"这一轮 PP 不和 TP, DP 组合，world_size（{world_size}）必须等于 pp_size（{pp_size}）")
     layout = init_parallel(tp_size, pp_size)
     torch.manual_seed(cfg.train.seed)
@@ -195,6 +205,9 @@ def main(cfg: PretrainExperiment, resume, device):
     data_dir = cfg.data.data_dir
 
     m = model.ModelForCausalLM(cfg.model)
+    if pp_size > 1:
+        m = split_model(m, layout.pp_rank, cfg.parallel.pp_first_stage_layers)
+        log(f"pp_size={pp_size}: 模型已切分，本卡第 {layout.pp_rank} 段，层 {list(m.pp_layers)}")
     m.to(device)
     if tp_size > 1:
         m = apply_tp(m)
@@ -202,7 +215,7 @@ def main(cfg: PretrainExperiment, resume, device):
     if cfg.parallel.zero_stage == 3 and world_size > 1:
         m = shard_model(m, device)
         log("zero_stage=3：已用 fully_shard 分片（每个 Block 一次，最外层一次）")
-    optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer, zero_stage=cfg.parallel.zero_stage, tp_size=layout.tp_size)
+    optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer, zero_stage=cfg.parallel.zero_stage, tp_size=layout.tp_size, pp_size=pp_size)
 
     B, T = cfg.data.B, cfg.data.T
     loader = dataloader.DataLoader(data_dir, 'train', B, T, device, rank=layout.dp_rank, world_size=layout.dp_size)

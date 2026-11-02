@@ -1,9 +1,11 @@
+from numpy import broadcast
 import math, collections, torch, os, time, contextlib
 from logger import log
 from dataclasses import asdict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from parallel.dist_utils import is_main, all_reduce_mean
 from parallel.fsdp import get_full_state
+from parallel.pp import broadcast_from_last, gpipe_step, is_pp_model
 from parallel.tp import gather_full_state_dict, is_tp_model
 
 
@@ -43,6 +45,7 @@ class Trainer:
         self.is_fsdp = hasattr(model, "set_requires_gradient_sync")
         self.raw_model = model.module if self.is_ddp else model
         self.is_tp = is_tp_model(self.raw_model)
+        self.is_pp = is_pp_model(self.raw_model)
 
     def fit(self, start_step=0):
         records = collections.defaultdict(list)  # 记录返回值
@@ -57,22 +60,26 @@ class Trainer:
             self.optimizer.zero_grad()
             loss_accum = 0.0
             part_extra_acc = {}
-            # 前向反向
-            for i, part in enumerate(parts):
-                # 只在最后一个 part 同步梯度
-                if self.is_ddp and i < len(parts) - 1:
-                    sync_ctx = self.model.no_sync()
-                else:
-                    sync_ctx = contextlib.nullcontext()
-                if self.is_fsdp:
-                    self.model.set_requires_gradient_sync(i == len(parts) - 1)
-                with sync_ctx:
-                    loss, part_extra = self.task.loss(part)
-                    loss.backward()
-                loss_accum += loss.detach()
-                # 存额外参数，如 GRPO 的 kl
-                for k, v in part_extra.items():
-                    part_extra_acc[k] = part_extra_acc.get(k, 0.0) + v
+            if self.is_pp:
+                loss_accum = gpipe_step(self.raw_model, parts)
+                loss_accum = broadcast_from_last(self.raw_model, loss_accum)
+            else:
+                # 前向反向
+                for i, part in enumerate(parts):
+                    # 只在最后一个 part 同步梯度
+                    if self.is_ddp and i < len(parts) - 1:
+                        sync_ctx = self.model.no_sync()
+                    else:
+                        sync_ctx = contextlib.nullcontext()
+                    if self.is_fsdp:
+                        self.model.set_requires_gradient_sync(i == len(parts) - 1)
+                    with sync_ctx:
+                        loss, part_extra = self.task.loss(part)
+                        loss.backward()
+                    loss_accum += loss.detach()
+                    # 存额外参数，如 GRPO 的 kl
+                    for k, v in part_extra.items():
+                        part_extra_acc[k] = part_extra_acc.get(k, 0.0) + v
             loss_accum = all_reduce_mean(loss_accum)  # step_extra, part_extra 没有跨进程平均，目前只有预训练用 DDP，没有额外数字
             # 梯度裁剪
             if hasattr(self.optimizer, "reduce_grads"):
@@ -130,7 +137,7 @@ class Trainer:
         if self.ckpt_dir is not None:
             if self.is_fsdp:
                 model_state, opt_state = get_full_state(self.model, self.optimizer)
-            elif self.is_tp:
+            elif self.is_tp or self.is_pp:
                 model_state = gather_full_state_dict(self.raw_model)
                 opt_state = self.optimizer.state_dict()
             else:

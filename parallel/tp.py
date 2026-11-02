@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from model import ModelForCausalLM
 from parallel.dist_utils import get_layout, get_rank, get_tp_group, get_world_size
+from parallel.pp import is_pp_model
 
 
 class CopyToTP(torch.autograd.Function):
@@ -125,7 +126,10 @@ def load_full_state_dict(model, full_sd):
     if set(model.state_dict()) != set(full_sd):
         missing = set(model.state_dict()) - set(full_sd)
         extras = set(full_sd) - set(model.state_dict())
-        raise ValueError(f"gather 出来的 state_dict 和 model 的键不一致: 缺少 {missing}, 多余 {extras}")
+        if missing:
+            raise ValueError(f"gather 出来的 state_dict 和 model 的键不一致: 缺少 {missing}")
+        if extras and not is_pp_model(model):
+            raise ValueError(f"gather 出来的 state_dict 和 model 的键不一致: 多余 {extras}")
     layout = get_layout()
     tp_size, tp_rank = layout.tp_size, layout.tp_rank
     with torch.no_grad():
