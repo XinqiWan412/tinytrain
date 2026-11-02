@@ -5,6 +5,7 @@ import torch.distributed as dist
 _layout = None
 _tp_group = None
 _pp_group = None
+_dp_group = None
 _embed_group = None
 
 
@@ -89,7 +90,7 @@ class ParallelLayout:
 
 def compute_layout(rank, world_size, tp_size, pp_size=1):
     if world_size % (tp_size * pp_size) != 0:
-        raise ValueError(f"world_size={world_size} 不能被 tp_size={tp_size} 整除")
+        raise ValueError(f"world_size={world_size} 不能被 tp_size*pp_size={tp_size*pp_size} 整除")
     dp_size = world_size // (tp_size * pp_size)
     return ParallelLayout(
         tp_rank=rank % tp_size,
@@ -102,13 +103,12 @@ def compute_layout(rank, world_size, tp_size, pp_size=1):
 
 
 def init_parallel(tp_size, pp_size=1):
-    global _layout, _tp_group, _pp_group, _embed_group
+    global _layout, _tp_group, _pp_group, _embed_group, _dp_group
     rank = get_rank()
     world_size = get_world_size()
     _layout = compute_layout(rank, world_size, tp_size, pp_size)
     if tp_size > 1:
-        for g in range(world_size // tp_size):
-            ranks = list(range(g * tp_size, (g + 1) * tp_size))
+        for ranks in tp_group_ranks(world_size, tp_size, pp_size):
             group = dist.new_group(ranks)
             if rank in ranks:
                 _tp_group = group
@@ -121,6 +121,12 @@ def init_parallel(tp_size, pp_size=1):
             group = dist.new_group(ranks)
             if rank in ranks:
                 _embed_group = group
+    dp_size = _layout.dp_size
+    if dp_size > 1:
+        for ranks in dp_group_ranks(world_size, tp_size, pp_size):
+            group = dist.new_group(ranks)
+            if rank in ranks:
+                _dp_group = group
     return _layout
 
 
@@ -134,16 +140,6 @@ def get_layout():
 def get_tp_group():
     if _tp_group is None:
         raise RuntimeError("先调用 init_parallel，且 tp_size > 1")
-    return _tp_group
-
-
-def pp_group_ranks(world_size, tp_size, pp_size):
-    """8 卡时会返回 [[0, 4], [1, 5], [2, 6], [3, 7]]"""
-    groups = {}
-    for r in range(world_size):
-        layout = compute_layout(r, world_size, tp_size, pp_size)
-        groups.setdefault((layout.dp_rank, layout.tp_rank), []).append(r)
-    return list(groups.values())
 
 
 def embed_group_ranks(world_size, tp_size, pp_size):
@@ -161,4 +157,35 @@ def get_embed_group():
     if _embed_group is None:
         raise RuntimeError("先调用 init_parallel，且 pp_size > 1")
     return _embed_group
+    return _tp_group
+
+
+def get_dp_group():
+    if _dp_group is None:
+        raise RuntimeError("先调用 init_parallel，且 dp_size > 1")
+    return _dp_group
+
+
+def _group_ranks(world_size, tp_size, pp_size, key_fn):
+    groups = {}
+    for r in range(world_size):
+        layout = compute_layout(r, world_size, tp_size, pp_size)
+        groups.setdefault(key_fn(layout), []).append(r)
+    return list(groups.values())
+
+
+def pp_group_ranks(world_size, tp_size, pp_size):
+    """8 卡时会返回 [[0, 4], [1, 5], [2, 6], [3, 7]]"""
+    return _group_ranks(world_size, tp_size, pp_size, lambda l: (l.dp_rank, l.tp_rank))
+
+
+def dp_group_ranks(world_size, tp_size, pp_size):
+    """8 卡时会返回 [[0, 2], [1, 3], [4, 6], [5, 7]]"""
+    return _group_ranks(world_size, tp_size, pp_size, lambda l: (l.pp_rank, l.tp_rank))
+
+
+def tp_group_ranks(world_size, tp_size, pp_size):
+    """8 卡 TP=2 时会返回 [[0, 1], [2, 3], [4, 5], [6, 7]]"""
+    return _group_ranks(world_size, tp_size, pp_size, lambda l: (l.pp_rank, l.dp_rank))
+
 

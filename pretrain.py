@@ -75,6 +75,8 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         raise ValueError("tp 暂不支持 muon，请改用 adamw")
     if tp_size > 1 and zero_stage != 0:
         raise ValueError("这一轮 TP 不和 ZeRO / FSDP2 组合：tp_size>1 时 zero_stage 必须为 0")
+    if pp_size > 1 and zero_stage != 0:
+        raise ValueError("这一轮 PP 不和 ZeRO / FSDP2 组合：pp_size>1 时 zero_stage 必须为 0")
     lr, betas, weight_decay = train_config.max_lr, train_config.betas, train_config.weight_decay
     if optimizer_name == "adamw":
         wd, keep = [], []
@@ -183,25 +185,16 @@ def main(cfg: PretrainExperiment, resume, device):
     # 检查 tp, pp 的参数配置
     tp_size = cfg.parallel.tp_size
     if tp_size > 1:
-        if cfg.parallel.zero_stage != 0:
-            raise ValueError("tp_size>1 时 zero_stage 必须为 0：这一轮 TP 不和 ZeRO / FSDP2 组合")
-        if world_size != tp_size:
-            raise ValueError(f"这一轮 TP 不和 DP 组合，world_size（{world_size}）必须等于 tp_size（{tp_size}）")
         if cfg.train.optimizer != "adamw":
             raise ValueError("tp_size>1 时只支持 adamw")
     pp_size = cfg.parallel.pp_size
     if pp_size not in (1, 2):
         raise ValueError("这一轮 pp 只支持切 2 段")
-    if pp_size > 1:
-        if cfg.parallel.zero_stage != 0:
-            raise ValueError("pp_size > 1 时 zero_stage 必须为 0：这一轮 PP 不和 ZeRO / FSDP2 组合")
-        if tp_size != 1:
-            raise ValueError(f"这一轮 PP 不和 TP 组合：pp_size>1 时 tp_size 必须为 1")
-        if world_size != pp_size:
-            raise ValueError(f"这一轮 PP 不和 TP, DP 组合，world_size（{world_size}）必须等于 pp_size（{pp_size}）")
     pp_schedule = cfg.parallel.pp_schedule
     if pp_schedule not in ("gpipe", "1f1b"):
         raise ValueError(f"pp_schedule 目前是 {pp_schedule}, 只支持 'gpipe', '1f1b'")
+    if (tp_size > 1 or pp_size > 1) and cfg.parallel.zero_stage != 0:
+        raise ValueError("tp_size>1 或 pp_size>1 时 zero_stage 必须为 0：这一轮 TP/PP 不和 ZeRO / FSDP2 组合")
 
     layout = init_parallel(tp_size, pp_size)
     torch.manual_seed(cfg.train.seed)
