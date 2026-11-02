@@ -54,6 +54,7 @@ class ParallelConfig:
     tp_size: int = 1  # 张量并行的份数；1 表示不切
     pp_size: int = 1  # PP 的段数；1 表示不切
     pp_first_stage_layers: int = 0  # PP 第一段放几层，0 表示平分
+    pp_schedule: str = "1f1b"  # 可选 gpipe 或 1f1b
 
 
 @dataclass

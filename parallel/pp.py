@@ -63,6 +63,13 @@ def forward_last(model, x, targets):
     return loss
 
 
+def _act_buf(model, y):
+    B, T = y.shape
+    D = model.config.hidden_size
+    buf = torch.empty((B, T, D), dtype=torch.float32, device=y.device)
+    return buf
+
+
 def gpipe_step(model, parts):
     m = len(parts)
     peer = dist.get_global_rank(get_pp_group(), 1 - model.pp_stage)
@@ -78,7 +85,6 @@ def gpipe_step(model, parts):
             # ③ 把 h 存进 hs
             hs.append(h)
         # 反向收梯度
-        # for h in hs:
         for h in hs:
             # ① 准备和 h 一样的空箱子
             buf = torch.empty_like(h)
@@ -93,9 +99,7 @@ def gpipe_step(model, parts):
         # 前向收激活
         for _, y in parts:
             # ① 准备 (B, T, D) 的 fp32 空箱子
-            B, T = y.shape
-            D = model.config.hidden_size
-            buf = torch.empty((B, T, D), dtype=torch.float32, device=y.device)
+            buf = _act_buf(model, y)
             # ② 把激活收进箱子
             dist.recv(buf, src=peer)
             # ③ 箱子 requires_grad_()
@@ -203,3 +207,53 @@ class PPOptimizer:
             raise ValueError(f"checkpoint 要求 world_size={state['world_size']}, 当前 world_size={self.world_size}")
         # 加载本卡的那一项 state_dict
         self.optimizer.load_state_dict(state["per_rank"][self.rank])
+
+
+def _send_recv(t, buf, peer):
+    ops = [dist.P2POp(dist.isend, t, peer), dist.P2POp(dist.irecv, buf, peer)]
+    for req in dist.batch_isend_irecv(ops):
+        req.wait()
+
+
+def one_f_one_b_step(model, parts):
+    m = len(parts)
+    peer = dist.get_global_rank(get_pp_group(), 1 - model.pp_stage)
+    if model.pp_stage == 0:
+        # 灌满
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            h = forward_first(model, parts[0][0])
+        dist.send(h.detach(), dst=peer)
+        # 交替
+        for i in range(1, m):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                h_next = forward_first(model, parts[i][0])
+            g = torch.empty_like(h)
+            _send_recv(h_next.detach(), g, peer)
+            h.backward(g)
+            h = h_next
+        # 排空
+        g = torch.empty_like(h)
+        dist.recv(g, src=peer)
+        h.backward(g)
+        return None
+    else:
+        # 准备箱子
+        buf = _act_buf(model, parts[0][1])
+        dist.recv(buf, src=peer)
+        buf.requires_grad_()
+        total = 0.0
+        for i, (_, y) in enumerate(parts):
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                loss = forward_last(model, buf, y) / m
+            total += loss.detach()
+            loss.backward()
+            # 如果不是最后一份
+            if i != m - 1:
+                nxt = torch.empty_like(buf)
+                _send_recv(buf.grad, nxt, peer)
+                buf = nxt.requires_grad_()
+            # 如果是最后一份
+            else:
+                dist.send(buf.grad, peer)
+        return total
+

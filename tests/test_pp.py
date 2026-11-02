@@ -220,10 +220,10 @@ def compare_state_dicts(sd1, sd2, atol=None):
     assert not bad, f"{len(bad)} 个参数超出容差；最大差 {diffs[worst]:.2e}，在 {worst}"
 
 
-def run_pp(config_path, out_dir, nproc, pp_size, resume=False):
+def run_pp(config_path, out_dir, nproc, pp_size, resume=False, schedule="1f1b"):
     cmd = [sys.executable, "-m", "torch.distributed.run", "--standalone",
         f"--nproc_per_node={nproc}", "pretrain.py", "--config", config_path, "--set", f"parallel.pp_size={pp_size}",
-        "--set", f"run.ckpt_dir={out_dir}", "--set", f"run.log={out_dir / 'pp.log'}"]
+        "--set", f"run.ckpt_dir={out_dir}", "--set", f"run.log={out_dir / 'pp.log'}", "--set", f"parallel.pp_schedule={schedule}"]
     if resume:
         cmd.append("--resume")
     return run_subprocess(cmd)
@@ -276,6 +276,30 @@ def test_pp_resume(tmp_path, make_data_dir):
     # 加载两边的 final.pt
     ckpt_path1 = tmp_path / "full" / "final.pt"
     ckpt_path2 = tmp_path / "resume" / "final.pt"
+    ckpt1 = torch.load(ckpt_path1, map_location="cpu")
+    ckpt2 = torch.load(ckpt_path2, map_location="cpu")
+    # 比较参数
+    sd1 = ckpt1["model"]
+    sd2 = ckpt2["model"]
+    assert set(sd1) == set(sd2)
+    compare_state_dicts(sd1, sd2)
+    # 比较 val_loss
+    assert ckpt2["val_loss"] == ckpt1["val_loss"]
+
+
+def test_pp_schedules_identical(tmp_path, make_data_dir):
+    optimizer_name = "adamw"
+    nproc = 2
+    pp_size = 2
+    # 造数据，写配置
+    data_dir = make_data_dir(n_train=2, tokens_per_shard=129)
+    config_path = write_config(tmp_path, data_dir, optimizer_name)
+    # 一口气跑完
+    run_pp(config_path, tmp_path / "gpipe", nproc, pp_size, schedule="gpipe")
+    run_pp(config_path, tmp_path / "1f1b", nproc, pp_size, schedule="1f1b")
+    # 加载两边的 final.pt
+    ckpt_path1 = tmp_path / "gpipe" / "final.pt"
+    ckpt_path2 = tmp_path / "1f1b" / "final.pt"
     ckpt1 = torch.load(ckpt_path1, map_location="cpu")
     ckpt2 = torch.load(ckpt_path2, map_location="cpu")
     # 比较参数

@@ -5,7 +5,7 @@ from dataclasses import asdict
 from torch.nn.parallel import DistributedDataParallel as DDP
 from parallel.dist_utils import is_main, all_reduce_mean
 from parallel.fsdp import get_full_state
-from parallel.pp import broadcast_from_last, gpipe_step, is_pp_model
+from parallel.pp import broadcast_from_last, gpipe_step, is_pp_model, one_f_one_b_step
 from parallel.tp import gather_full_state_dict, is_tp_model
 
 
@@ -61,7 +61,8 @@ class Trainer:
             loss_accum = 0.0
             part_extra_acc = {}
             if self.is_pp:
-                loss_accum = gpipe_step(self.raw_model, parts)
+                step_fn = one_f_one_b_step if self.config.parallel.pp_schedule == "1f1b" else gpipe_step
+                loss_accum = step_fn(self.raw_model, parts)
                 loss_accum = broadcast_from_last(self.raw_model, loss_accum)
             else:
                 # 前向反向

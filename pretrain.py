@@ -180,7 +180,7 @@ def load_checkpoint(path, model, optimizer, optimizer_name, loader, device):
 
 def main(cfg: PretrainExperiment, resume, device):
     rank, world_size = get_rank(), get_world_size()
-    # 检查 tp_size, pp_size 的切分度配置
+    # 检查 tp, pp 的参数配置
     tp_size = cfg.parallel.tp_size
     if tp_size > 1:
         if cfg.parallel.zero_stage != 0:
@@ -199,6 +199,10 @@ def main(cfg: PretrainExperiment, resume, device):
             raise ValueError(f"这一轮 PP 不和 TP 组合：pp_size>1 时 tp_size 必须为 1")
         if world_size != pp_size:
             raise ValueError(f"这一轮 PP 不和 TP, DP 组合，world_size（{world_size}）必须等于 pp_size（{pp_size}）")
+    pp_schedule = cfg.parallel.pp_schedule
+    if pp_schedule not in ("gpipe", "1f1b"):
+        raise ValueError(f"pp_schedule 目前是 {pp_schedule}, 只支持 'gpipe', '1f1b'")
+
     layout = init_parallel(tp_size, pp_size)
     torch.manual_seed(cfg.train.seed)
     np.random.seed(cfg.train.seed)
