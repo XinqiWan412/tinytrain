@@ -132,9 +132,9 @@ torchrun --standalone --nproc_per_node=8 pretrain.py --config configs/adamw_112m
 | v0.8 | FSDP2（fully_shard） |
 | v0.9 | 手写 TP（张量并行）和 PP（流水线并行，GPipe / 1F1B） |
 | v0.10 | 3D 并行（DP×TP×PP；8 卡测速待补） |
-| 下一步 | 性能优化（MFU、torch.profiler、torch.compile、自写 Triton FlashAttention、分块 lm_head + CE、activation checkpointing） |
-| 之后 | 序列打包 + varlen attention → 推理框架（KV cache、批量调度，接入 GRPO rollout，与 vLLM 对照） |
+| 下一步 | 性能优化（MFU、torch.profiler、torch.compile、自写 Triton FlashAttention、分块 lm_head + CE、activation checkpointing），在本地单卡上做，最后租 A100 复测 |
+| 之后 | 标准评估（HellaSwag 等零样本任务，用 Qwen3-0.6B base 校准评估流程）→ 读入 Qwen3-0.6B，用 GRPO 在 GSM8K 上训练，在多类数据集上评估提升和遗忘 → 推理框架（KV cache、批量调度，接入 GRPO rollout，与 vLLM 对照）→ 序列打包 + varlen attention |
 
-可选：零样本 benchmark（如 HellaSwag）、两种优化器扫 lr 与 GRPO 多种子、PPO 式 ratio + clip / DAPO、更多题型、MoE、GitHub Actions CI、FSDP2 的 MixedPrecisionPolicy。
+可选：两种优化器扫 lr 与 GRPO 多种子、PPO 式 ratio + clip / DAPO、代码类评估（需要执行代码的沙箱）、MoE、GitHub Actions CI、FSDP2 的 MixedPrecisionPolicy。
 
 复现旧版本时先 `git checkout <版本号>`。

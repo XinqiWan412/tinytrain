@@ -321,4 +321,4 @@ FSDP2 把每个矩阵按行切开，step 时每张卡只有几行动量，而 Mu
 
 ## 下一步：性能优化
 
-多卡并行到此做完。下一步回到单卡：先用 torch.profiler 看清一步的时间花在哪、算出 MFU，再依次试 torch.compile、把自写的 Triton FlashAttention 注册成 custom op 接进来、分块算 lm_head 和 CE、activation checkpointing，每一项都量一下省了多少时间和显存。
+多卡并行到此做完。下一步回到单卡：先用 torch.profiler 看清一步的时间花在哪、算出 MFU，再依次试 torch.compile、把自写的 Triton FlashAttention 注册成 custom op 接进来、分块算 lm_head 和 CE、activation checkpointing，每一项都量一下省了多少时间和显存。这些都在本地单卡上做；做完后租一次 A100，在同一台机器上测优化前后的单卡速度和 MFU，租到多卡时顺便补测 3D。
