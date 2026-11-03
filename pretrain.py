@@ -214,6 +214,11 @@ def main(cfg: PretrainExperiment, resume, device):
     if cfg.parallel.zero_stage == 3 and world_size > 1:
         m = shard_model(m, device)
         log("zero_stage=3：已用 fully_shard 分片（每个 Block 一次，最外层一次）")
+    if cfg.perf.compile:
+        if world_size > 1:
+            raise ValueError(f"这一轮 compile 只支持单卡, 而 world_size={world_size}")
+        m.compile()
+        log("已打开 torch.compile（第一次 forward 时编译）")
     optimizer = configure_optimizer(m, cfg.train, cfg.train.optimizer, zero_stage=cfg.parallel.zero_stage, tp_size=layout.tp_size, pp_size=pp_size)
 
     B, T = cfg.data.B, cfg.data.T
