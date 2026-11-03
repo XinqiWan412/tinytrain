@@ -2,8 +2,9 @@
 
 ## 运行
 
-- `pytest -v`：76 个快测试，约 150 秒，不需要数据
-- `pytest -m slow -v`：2 个慢测试，需要原始数据
+- `pytest -v`：78 个快测试，约 170 秒，不需要数据
+- `pytest -m slow -v`：6 个慢测试。2 个需要原始数据；4 个是 3D 的两两组合和续训，不需要数据，约 30 秒
+- `pytest -m "" -v`：全部跑
 - pytest.ini 设了测试目录和 pythonpath，默认跳过标了 slow 的测试
 - 慢主要是多次起 torchrun。试过用 pytest-xdist 并行跑，本机反而慢了约 4 倍（单进程测试默认用满所有核，几个进程的线程互相抢），所以全量仍串行跑
 
@@ -26,7 +27,7 @@
 
 ### 多进程测试
 
-都在 CPU 上跑：把 CUDA_VISIBLE_DEVICES 置空，用 torchrun 起两个进程走 gloo，和在多卡机器上的启动方式相同。
+都在 CPU 上跑：把 CUDA_VISIBLE_DEVICES 置空，用 torchrun 起 2～8 个进程走 gloo，和在多卡机器上的启动方式相同。
 
 | 测试 | 比较的两边 | 容差 | 原因 |
 | --- | --- | --- | --- |
@@ -38,6 +39,7 @@
 | PP 调度对照 | pp_worker 两进程的 GPipe、1F1B vs 同一进程里的完整模型，4 份数据，一步之内 | 逐位相同（GPipe 对完整模型时不比共享参数） | 每段的计算、梯度累加顺序都和完整模型相同；共享参数的加法分组变了，所以只在 GPipe 与 1F1B 之间比 |
 | PP 等价 | torchrun 1 进程 vs torchrun 2 进程 PP（默认 1F1B），10 步 | AdamW 1e-5，Muon 1e-4（val_loss 用同样的相对容差） | 见下 |
 | GPipe 与 1F1B | 两种调度各跑 10 步完整训练 | 逐位相同 | 计算和累加顺序都相同 |
+| 3D 等价 | torchrun 1 进程 vs DP2×TP2、DP2×PP2、TP2×PP2（4 进程）、DP2×TP2×PP2（8 进程），10 步 | val_loss 相对 1e-5，参数 1e-4 | 沿用 TP；默认只跑 3D 那个，两两组合标 slow |
 | 中途续训 | 中断再续 vs 一口气跑完（各做法各自比） | 逐位相同 | 同一种做法，计算完全相同 |
 
 容差能不留就不留，因为容差会掩盖末位差别。ZeRO-2 那轮总范数不跨卡相加的错误只造成约 1.4e-4 的差，1e-3 的容差就会漏掉（1e-5 仍能抓住）。
@@ -49,6 +51,8 @@ TP 等价的对照组用 torchrun 起 1 个进程，而不是直接用 python �
 PP 的容差比 TP 小。PP 只改了共享参数（embedding / lm_head）这一处梯度的加法分组，其余参数每份数据的计算和单卡完全相同，所以 AdamW 用 1e-5 就能通过；Muon 的正交化会把末位差别放大，放宽一档到 1e-4。典型的错误（去掉共享参数的梯度求和）在 val_loss 上的相对差约 1e-3，比容差大两个数量级以上。
 
 GPipe 与 1F1B 要求逐位相同，是因为两者之间最可能出的错正好只差末位：反向顺序不一致时，值都对，只是梯度的累加顺序变了，allclose 抓不到。
+
+3D 测试除了 3D 本身，还要测两两组合，因为"用错了组"只有在组和全局组不同时才测得出来。TP 单独用时 TP 组就是全局组，get_tp_group 漏写 return、一直落到全局组上，原有 TP 测试全部通过。小配置正好够用：2 层能切成 1/1 两段，4 个头、2 个 KV 头能切给 TP=2，全局 64 个 token 在 dp=2 时每条流水线分到 2 份。8 进程的测试在本机每次约 8～10 秒。
 
 CPU 上的多进程测试有两件事测不到。一是 autocast 在 CPU 上不生效，测不到 GPU 上两段之间传的激活是不是 fp32、和接收的缓冲区对不对得上，上云前另外在单卡 GPU 上确认过。二是 gloo 对小消息可能先缓冲，1F1B 里两段同时用阻塞的方式发送，在 CPU 上不一定卡住，所以收发要打包提交（batch_isend_irecv）这一点只能靠分析，测试保证不了。
 
@@ -81,6 +85,8 @@ CPU 上的多进程测试有两件事测不到。一是 autocast 在 CPU 上不�
 | GPipe 两段的反向都倒序 | pp_worker 失败，最大差 4.66e-10，只差末位；加入 1F1B 后，GPipe 与 1F1B 的完整训练也不再逐位相同（45 个参数，最大差 7.0e-7）；其余测试默认走 1F1B，照样通过 |
 | PP 去掉 reduce_grads 里共享参数的求和 | 两个对单卡测试（AdamW、Muon）都在 val_loss 上就失败，相对差约 1e-3 |
 | PP 的 Muon 分组不认 pp_shared | 只用小配置手动对照过，没有跑测试：第 0 步相同，从第 1 步起 loss 与单卡差 1e-3～1e-2，而且越来越大，每步耗时约变为 4 倍 |
+| ParallelOptimizer 的 DP 同步改成在全局组求平均（DDP 的默认做法） | DP2×TP2 等价测试在 val_loss 上失败（5.56731 → 5.56788，相对差约 1e-4，是容差的 10 倍），训练不报错。不要在 3D 下这样改：两段的参数个数和形状不同，全局组上的 all-reduce 会一直卡到超时 |
+| get_tp_group 漏写 return（实际发生过） | TP 单独用的测试全部通过；DP2×TP2 等价测试失败（val_loss 相对差约 4e-4，训练前的 eval 就已不同）；TP2×PP2 和 3D 卡到超时。布局测试只测纯函数，抓不到 |
 
 从这些记录看出的规律：
 
@@ -91,6 +97,7 @@ CPU 上的多进程测试有两件事测不到。一是 autocast 在 CPU 上不�
 - 只看单层的输出和权重梯度，查不出漏掉 f 的错，要比输入梯度；在整个模型里，这个错会一路传到前面所有层
 - 只差末位的错误（比如反向顺序不一致）只有要求逐位相同的测试能抓到。两种实现本应算同一个东西时，就要求逐位相同，不留容差
 - CPU 上的多进程测试测不到只在 GPU 上才有的情况（autocast 下的数据类型、NCCL 收发互相等住），要单独检查，或者靠分析
+- 用错进程组的错，只有在组和全局组不同的配置下才测得出来；组合测试不能只测"每种并行单独用"。组用错时多进程测试可能直接卡死，所以 run_subprocess 要设超时，超时后还要清掉残留的 worker
 
 ## 各测试文件
 
@@ -110,6 +117,7 @@ CPU 上的多进程测试有两件事测不到。一是 autocast 在 CPU 上不�
 - `test_fsdp.py`：两进程 FSDP2 与 DDP allclose、检查日志里确实分了片、final.pt 能被 load_model 读回；中途续训逐位相同；muon 配 zero_stage=3 时报错
 - `test_tp.py`：并行布局的手算例子；用 tp_worker.py、tp_model_worker.py 做层级和整模型对照；torchrun 1 进程与 2 进程 TP 比较 val_loss 和 final.pt（参数 1e-4）、load_model 读回；两进程中途续训逐位相同；muon 配 tp_size=2、TP 配 ZeRO 时报错。compare_state_dicts 失败时报出超标参数的个数和最大差所在的参数
 - `test_pp.py`：并行布局（含 PP 编号）和 PP 组、embedding 组组员的手算例子；单进程里检查切分（两段的键不重叠、合起来等于完整模型，值不变，层名保持全局编号）、两段前向的 loss、模拟交接后各参数的梯度，都与完整模型逐位相同；用 pp_worker.py 对照 GPipe、1F1B 和完整模型；torchrun 1 进程与 2 进程 PP 比较 val_loss 和 final.pt（AdamW 1e-5、Muon 1e-4），检查日志里确实切分了、load_model 能读回；GPipe 与 1F1B 的完整训练逐位相同；两进程中途续训逐位相同
+- `test_3d.py`：三种组（TP、DP、PP）和 embedding 组的成员，8 卡时与手算的表一致，几种布局下每种组覆盖每张卡恰好一次、任意两种组的交集只有自己；torchrun 1 进程对照 DP2×TP2、DP2×PP2、TP2×PP2、DP2×TP2×PP2 比较 val_loss 和 final.pt（参数 1e-4），并检查 checkpoint 里 tp、pp、dp 的大小；3D 中途续训逐位相同。只有 3D 等价测试是快测试
 - `zero2_worker.py`：不是测试文件，由 test_zero.py 用 torchrun 起两个进程运行
 - `tp_worker.py`：不是测试文件，两进程上完整 MLP 与切开的 MLP 比较输出、输入梯度、各卡权重梯度
 - `tp_model_worker.py`：不是测试文件，两进程上整模型对照：各参数梯度（q_norm、k_norm 两卡求和后）、拼回和切回、TPOptimizer 的梯度求和、裁剪总范数、一步 SGD 更新

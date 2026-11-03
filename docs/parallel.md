@@ -23,7 +23,7 @@ torchrun --standalone --nproc_per_node=4 pretrain.py --config configs/adamw_112m
 torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m/pretrain.toml --set parallel.tp_size=2
 ```
 
-这一轮只支持 tp_size=2、卡数等于 tp_size、zero_stage=0、AdamW，不满足时 main 一开头就报错。模型部分存成和单卡相同的格式；优化器状态每卡一项，续训时卡数要相同。
+只支持 tp_size=2（KV 头只有 2 个）、zero_stage=0、AdamW，不满足时 main 一开头就报错；可以和 DP、PP 组合，见下面的 3D 用法。
 
 流水线并行用 `parallel.pp_size` 打开（默认 1）：
 
@@ -31,15 +31,23 @@ torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m
 torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m/pretrain.toml --set parallel.pp_size=2 --set parallel.pp_first_stage_layers=7
 ```
 
-这一轮只支持 pp_size=2、卡数等于 pp_size、tp_size=1、zero_stage=0，AdamW、Muon 都支持，不满足时 main 一开头就报错。另外两个选项：
+只支持 pp_size=2、zero_stage=0，AdamW、Muon 都支持，不满足时 main 一开头就报错；可以和 DP、TP 组合，见下面的 3D 用法。
 
 - `parallel.pp_first_stage_layers`：第一段放几层，默认 0 表示平分。这个模型 7/5 最快，见 [results.md](results.md)
 - `parallel.pp_schedule`：`1f1b`（默认）或 `gpipe`，两者训练结果逐位相同，1F1B 更省显存
 
 模型部分存成和单卡相同的格式；优化器状态每卡一项，续训时卡数和切点都要相同。
 
-- 卡数要同时整除 8（65,536 ÷ B×T）和 eval_steps（默认 20），所以默认配置下可以用 1、2、4 张；用 8 张卡时要把 eval_steps 改成 8 的倍数，比如 `--set data.eval_steps=24`
-- 加 `--resume` 照样能续训。四种做法存的模型部分都和单卡格式相同，load_model、export_hf、sft.py 能直接读；但 zero_stage 0、1～2、3 这三类存的 checkpoint 不能互相续训，zero_stage=3 存的只能用 zero_stage=3 多卡续训
+- 三种并行可以同时打开，卡数 = dp × tp × pp，DP 份数由卡数推出。8 卡 DP2×TP2×PP2：
+
+```bash
+torchrun --standalone --nproc_per_node=8 pretrain.py --config configs/adamw_112m/pretrain.toml --set parallel.tp_size=2 --set parallel.pp_size=2 --set parallel.pp_first_stage_layers=7 --set data.eval_steps=24
+```
+
+- 只要 tp_size 或 pp_size 大于 1，就不包 DDP，DP 的梯度同步由优化器完成，见 [3D 并行](#3d-并行dptppp)。
+
+- DP 份数（卡数 ÷ (tp_size × pp_size)）要同时整除 65,536 ÷ (B×T)（默认是 8）和 eval_steps（默认 20）。纯 DP 时可以用 1、2、4 张卡；DP 份数为 8 时要把 eval_steps 改成 8 的倍数，比如 --set data.eval_steps=24
+- 加 `--resume` 照样能续训。四种做法存的模型部分都和单卡格式相同，load_model、export_hf、sft.py 能直接读；但 zero_stage 0、1～2、3 这三类存的 checkpoint 不能互相续训，zero_stage=3 存的只能用 zero_stage=3 多卡续训；TP、PP、3D 存的 checkpoint 续训时，dp、tp、pp 三个大小都要和存的时候相同
 - 本地没有多卡时，可以用 CPU 验证多进程的逻辑：`CUDA_VISIBLE_DEVICES= torchrun --standalone --nproc_per_node=2 pretrain.py --config 小配置`，tests/ 里的多进程测试都是这么做的
 - 复现 results.md 里的测速：加 `--set train.max_steps=300`，并用 `--set run.ckpt_dir=…`、`--set run.log=…` 指到临时目录；单卡那次用 python 启动，命令前加 `CUDA_VISIBLE_DEVICES=0`。前 300 步只用到第一片训练数据，云上只需传 train_000000.bin、val_000000.bin 和 meta.json
 
@@ -54,7 +62,7 @@ torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m
 - 数据按进程跳着读：DataLoader 的 pos 是所有进程共同的位置，读数据时再加上 rank×B×T 的偏移，每批前进 进程数×B×T，所有进程在同一步换片。state_dict 不用改，续训时各进程自动回到自己的位置。这样每一步各进程合起来读的，正是单进程会读的那些 token，平均后的梯度和单进程相同，只差浮点加法顺序
 - 日志里的 loss 和 val_loss 先跨进程平均（all_reduce_mean 先求和再除以卡数，因为 gloo 不支持 AVG）；evaluate 每个进程测 eval_steps ÷ 卡数 批再平均，所以卡数要整除 eval_steps
 - 只有 0 号进程写日志、存 checkpoint，存的是包装前的模型；训练结束时把各卡的峰值显存收集到 0 号进程打印
-- 并行布局：parallel/dist_utils.py 的 compute_layout 算出本卡的 TP、DP、PP 编号和份数，按 Megatron 的惯例 TP 变化最快（放在编号相邻的卡上）、PP 变化最慢；DataLoader 用 DP 编号和份数读数据，只在 DP 份数大于 1 时包 DDP。不开 TP、PP 时 DP 编号就是 rank、份数就是卡数，和原来一样。进程组都由 init_parallel 建：TP 组是编号相邻的 tp_size 张卡；pp_group_ranks 从布局推出 PP 组（tp、dp 编号都相同的卡归成一条流水线），每条流水线的首尾两段再组成 embedding 组。每个进程要对每个组都调用 new_group，自己不在的组也要调
+- 并行布局：parallel/dist_utils.py 的 compute_layout 算出本卡的 TP、DP、PP 编号和份数，按 Megatron 的惯例 TP 变化最快（放在编号相邻的卡上）、PP 变化最慢；DataLoader 用 DP 编号和份数读数据，只在纯 DP（DP 份数大于 1，tp_size、pp_size 都是 1）时包 DDP。不开 TP、PP 时 DP 编号就是 rank、份数就是卡数，和原来一样。进程组都由 init_parallel 建，三种组由同一个 _group_ranks 按"另外两个编号相同"归组：TP 组是 pp、dp 编号都相同的卡（编号相邻），PP 组是 dp、tp 编号都相同的卡，DP 组是 pp、tp 编号都相同的卡；每条流水线的首尾两段再组成 embedding 组。每个进程要对每个组都调用 new_group，自己不在的组也要调
 
 ### Trainer 里的接入点
 
@@ -253,15 +261,64 @@ FSDP2 把每个矩阵按行切开，step 时每张卡只有几行动量，而 Mu
 - 不做 interleaved 1F1B（每张卡放几段不相邻的层，用来缩小气泡）和 zero-bubble 一类的调度
 - 默认切点仍是平分，没有改成 7/5：最快的切点和模型、卡型都有关，作为测速结论写在 results.md 里
 
+## 3D 并行（DP×TP×PP）
+
+### 做法
+
+- 三种并行叠在一起，卡数 = dp × tp × pp。8 卡 DP2×TP2×PP2：8 张卡分成 2 份做数据并行，每份是一条 2 段的流水线，每段由 2 张卡做张量并行
+- 进程组。编号规则不变（TP 变化最快、PP 最慢），每张卡恰好属于每种组里的一个，同一种组的成员另外两个编号都相同：
+
+| 组 | 8 卡时的成员 | 组内相同的编号 | 在组里做什么 |
+| --- | --- | --- | --- |
+| TP 组 | [0,1] [2,3] [4,5] [6,7] | pp、dp | f / g 的 all-reduce；q_norm、k_norm 梯度求和；裁剪时平方和相加 |
+| DP 组 | [0,2] [1,3] [4,6] [5,7] | pp、tp | 每步把所有梯度求平均 |
+| PP 组 | [0,4] [1,5] [2,6] [3,7] | dp、tp | 两段之间收发激活和梯度；广播 loss；裁剪时平方和相加 |
+| embedding 组 | 2 段时和 PP 组相同 | — | 共享的 embedding / lm_head 梯度求和 |
+
+- DP 不用 DDP。只要 tp>1 或 pp>1 就不包 DDP，反向全部结束后由优化器对每个参数在 DP 组里 all-reduce 再除以 dp_size；纯 DP 时仍用 DDP。不用 DDP 有两个原因：PP 的调度不走 model.forward，DDP 在 forward 里为梯度同步做的准备不会发生；DDP 默认在全局组里平均，TP 两张卡上切开的参数形状一样、内容不同，会被当成同一个参数的副本平均到一起，不报错，结果却是错的（改坏验证见 [testing.md](testing.md#临时改坏记录)）
+- 合并的优化器。TPOptimizer 和 PPOptimizer 合成 parallel/optimizer.py 的 ParallelOptimizer，tp>1 或 pp>1 时由 configure_optimizer 返回，按参数上的标记办事。上面 TP、PP 两节提到那两个类的地方，现在都由它完成：
+  - reduce_grads：带 tp_sum_grad 的在 TP 组求和，带 pp_shared 的在 embedding 组求和，所有参数在 DP 组求平均。三件事都是线性的、作用在不同的组上，先后顺序不影响结果
+  - clip_grad_norm_：每张卡只加该由自己算的那部分平方和（切开的参数每卡都加自己那一块，不切的只在 tp_rank=0 的卡上加，共享参数只在第一段加），再按需在 TP 组、PP 组里相加。不在 DP 组里加：DP 平均之后各副本的梯度完全相同
+  - 优化器状态仍是每卡一项，收集到 0 号；checkpoint 里记下 dp、tp、pp 三个大小，续训时逐项核对
+- 不用改就能组合的部分：
+  - DataLoader 按 DP 编号读，同一条流水线上的 tp×pp 张卡读同一批数据，累积次数和 tok/s 按 dp_size 算
+  - loss 先在 PP 组里从最后一段广播，再做全局平均；同一条流水线上的值都相同，所以全局平均等于各份 DP 的平均
+  - checkpoint 按参数名拼回，各 DP 副本发来的分片按 tp_rank 存进字典，后到的覆盖先到的，值本来就相同
+  - 激活收发的对象由 PP 组换算出全局编号，所以 TP 的 0 号卡只和下一段 TP 的 0 号卡交换
+- 只改了一处模型切分：apply_tp 跳过 PP 切分留下的 nn.Identity 占位层
+- 初始化：所有进程用同一个种子建完整模型，再切段、切 TP，同一 DP 组里的副本一开始就逐位相同，所以不像 ZeRO-2 那样开头广播参数
+
+### 正确性标准
+
+- 布局：8 卡时各组成员与上表一致。对 8 卡 2×2×2、4 卡 TP2、4 卡 PP2，每种组都覆盖每张卡恰好一次，任意两种组的交集只有自己。只查三种组共同的交集太弱：DP 组写成和 PP 组一样时，三者的交集仍然只有自己
+- torchrun 1 进程对照 DP2×TP2、DP2×PP2、TP2×PP2、DP2×TP2×PP2 各跑 10 步：参数 allclose（atol 1e-4），val_loss 相对误差 1e-5，并检查 checkpoint 里 tp、pp、dp 的大小确实生效。容差沿用 TP 那一轮
+- DP2×TP2×PP2 中途续训与一口气跑完逐位相同
+- 原有 TP、PP 测试只改了类名和检查优化器状态格式的那条断言，全部通过
+
+### 踩过的坑
+
+- get_tp_group 漏写了 return，一直返回 None，TP 的通信全落到了全局组上。TP 单独用时卡数等于 tp_size，全局组碰巧就是 TP 组，原有测试全部通过；DP2×TP2 时，训练前的 val_loss 就差了约 8e-4（相对），因为两份不同数据算出的部分和被加到了一起，刚初始化时注意力和 MLP 的输出很小，所以只偏一点；TP2×PP2 时，第一段在全局组上等着做 all-reduce，第二段在等收激活，一直卡到超时。布局测试只测纯函数，抓不到；是等价测试抓到的，在 evaluate 里打印各卡运行时的组成员（dist.get_process_group_ranks）才定位到。教训：只有组和全局组不同的配置，才测得出"用错了组"
+- 多进程测试超时后，torchrun 起的 worker 可能留在后台占着 CPU，之后的测试越跑越慢，看起来像是整体变慢了，要先清掉
+- `pytest -k dp2_tp2` 按子串匹配，会把 dp2_tp2_pp2 也选上；只跑一个参数化用例要写完整编号
+
+### 决定不做的事
+
+- 不和 ZeRO、FSDP2 组合；有 TP 时仍只支持 AdamW；PP 仍只切 2 段
+- DP 同步不和反向重叠，也不把小梯度合并成桶，这一轮先求对
+- 不去掉 TP 两张卡之间重复的激活收发：同一段的两张 TP 卡发出的激活完全相同，Megatron 会先拆开传、到对面再拼起来，这里每张卡传整份，留作可选
+- DP×PP 可以用 Muon，但等价测试只测了 AdamW
+
+### 测速
+
+待补，暂时租不到单机 8 卡。计划见 [results.md](results.md#3d-并行单机-8-卡adamw-路线v010测速待补)：dp=2 时每条流水线每步只分到 4 份，气泡从 1/9 涨到 1/5；把 B 改成 8 能分到 8 份，但每份的矩阵乘变小，哪种更快要实测。
+
 ## 待做
 
 - FSDP2 支持 Muon：step 时先把每个矩阵的动量凑齐，再正交化
 - 查 AdamW 路线下 ZeRO-1 的 3 号卡多出的约 440 MiB（用显存快照）
+- 补测 3D 的 8 卡速度（用 v0.10 标签的代码）
 - 可选：FSDP2 的 MixedPrecisionPolicy，参数以 bf16 收集，这一步的通信量减半，但数值和 autocast 不完全一样，作为单独的实验
 
-## 下一步：3D 并行
+## 下一步：性能优化
 
-- 单机 8 卡组成 DP2×TP2×PP2，每张卡同时属于一个 DP 组、一个 TP 组、一个 PP 组，几种通信各走各的组：DDP 只在 DP 组里同步梯度（包 DDP 时传入 DP 组），TP 的 all-reduce 在 TP 组里，激活的收发在 PP 组里，共享参数的梯度在每条流水线自己的 embedding 组里求和
-- 已经铺好的部分：compute_layout 能算三种编号；init_parallel 的 TP 组按全部 world_size ÷ tp_size 个建，PP 组和 embedding 组由布局推出。还要补的是 DP 组
-- 要合并的部分：TPOptimizer 和 PPOptimizer 合成一个，梯度求和、裁剪时的平方和各在自己的组里做。loss 广播之后的 all_reduce_mean 不用改，在全体卡上平均正好就是各份 DP 的平均
-- 可选：interleaved 1F1B；用 PyTorch 自带的 parallelize_module、torch.distributed.pipelining 做对照
+多卡并行到此做完。下一步回到单卡：先用 torch.profiler 看清一步的时间花在哪、算出 MFU，再依次试 torch.compile、把自写的 Triton FlashAttention 注册成 custom op 接进来、分块算 lm_head 和 CE、activation checkpointing，每一项都量一下省了多少时间和显存。
