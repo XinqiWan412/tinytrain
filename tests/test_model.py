@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import model
-from model import estimate_flops_per_token, ModelForCausalLM
+from model import estimate_flops_per_token, ModelForCausalLM, Attention
 
 
 def test_rmsnorm():
@@ -170,3 +170,32 @@ def test_flops_per_token(tiny_config):
     n = sum(m.weight.numel() for m in model.modules() if isinstance(m, nn.Linear))
     assert estimate_flops_per_token(tiny_config, T) == 6*n + 12*L*H*dh*T
 
+
+def test_enable_gqa_matches(tiny_config):
+    assert tiny_config.num_attention_heads != tiny_config.num_key_value_heads
+    model = ModelForCausalLM(tiny_config)
+    x = torch.randint(0, model.config.vocab_size, (2, 16))
+    targets = torch.randint(0, model.config.vocab_size, (2, 16))
+    # 默认跑一遍，存梯度
+    logits, loss = model(x, targets)
+    loss.backward()
+    grads = []
+    for p in model.parameters():
+        grads.append(p.grad.detach().clone())
+    
+    # enable_gqa 打开，再跑一遍
+    model.zero_grad()
+    for mod in model.modules():
+        if isinstance(mod, Attention):
+            mod.enable_gqa = True
+    logits2, loss = model(x, targets)
+    loss.backward()
+    grads2 = []
+    for p in model.parameters():
+        grads2.append(p.grad.detach().clone())
+    
+    # 验证 logits 和 grads 相等
+    assert torch.allclose(logits, logits2, atol=1e-6)
+    for g1, g2 in zip(grads, grads2):
+        assert torch.allclose(g1, g2, atol=1e-6)
+    

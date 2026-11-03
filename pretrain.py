@@ -214,6 +214,10 @@ def main(cfg: PretrainExperiment, resume, device):
     if cfg.parallel.zero_stage == 3 and world_size > 1:
         m = shard_model(m, device)
         log("zero_stage=3：已用 fully_shard 分片（每个 Block 一次，最外层一次）")
+    if cfg.perf.enable_gqa:
+        for mod in m.modules():
+            if isinstance(mod, model.Attention):
+                mod.enable_gqa = True
     if cfg.perf.compile:
         if world_size > 1:
             raise ValueError(f"这一轮 compile 只支持单卡, 而 world_size={world_size}")

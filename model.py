@@ -68,6 +68,7 @@ class Attention(nn.Module):
         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # (dh,)
         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)  # (dh,)
         self.tp_copy = nn.Identity()
+        self.enable_gqa = False
     
     def forward(self, x, cos, sin):
         # x 是 (B, T, D)
@@ -85,9 +86,10 @@ class Attention(nn.Module):
         v = v.transpose(1, 2)  # (B, H_kv, T, dh)
         cos, sin = cos[:T], sin[:T]  # 切前 T 行，对齐 qk
         q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
-        k = k.repeat_interleave(g, dim=1)
-        v = v.repeat_interleave(g, dim=1)
-        out = F.scaled_dot_product_attention(q, k, v, is_causal=True)  # (B, H, T, dh)
+        if not self.enable_gqa:
+            k = k.repeat_interleave(g, dim=1)
+            v = v.repeat_interleave(g, dim=1)
+        out = F.scaled_dot_product_attention(q, k, v, is_causal=True, enable_gqa=self.enable_gqa)  # (B, H, T, dh)
         out = out.transpose(1, 2)  # (B, T, H, dh)
         out = out.reshape(B, T, H*dh)
         out = self.o_proj(out)  # (B, T, D)

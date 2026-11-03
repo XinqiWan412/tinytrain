@@ -62,6 +62,7 @@ class PerfConfig:
     peak_tflops: float = 85.7  # 本机 4070 Ti Super 上 cuBLAS bf16 实测的值，换卡时要改
     profile: bool = False
     compile: bool = False
+    enable_gqa: bool = False
 
 
 @dataclass
