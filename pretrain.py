@@ -7,8 +7,9 @@ import os
 import argparse
 from logger import log, setup_log
 from muon import MuonWithAdamW
-from parallel.pp import PPOptimizer, broadcast_from_last, is_pp_model, pp_forward, split_model
-from parallel.tp import TPOptimizer, apply_tp, is_tp_model, load_full_state_dict
+from parallel.pp import broadcast_from_last, is_pp_model, pp_forward, split_model
+from parallel.tp import apply_tp, is_tp_model, load_full_state_dict
+from parallel.optimizer import ParallelOptimizer
 from trainer import Trainer
 from config import PretrainExperiment, TrainConfig, DataConfig, load_config
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -117,10 +118,8 @@ def configure_optimizer(model: model.ModelForCausalLM, train_config: TrainConfig
         cls, kwargs = MuonWithAdamW, {}
     else:
         raise ValueError(f"unknown optimizer: {optimizer_name!r}, expected one of: adamw, muon")
-    if tp_size > 1:
-        return TPOptimizer(param_groups, cls, **kwargs)
-    if pp_size > 1:
-        return PPOptimizer(param_groups, cls, **kwargs)
+    if tp_size > 1 or pp_size > 1:
+        return ParallelOptimizer(param_groups, cls, **kwargs)
     if zero_stage in (0, 3):
         # 3 时模型已经分片，参数是 DTensor，普通优化器直接用
         return cls(param_groups, **kwargs)
@@ -222,7 +221,8 @@ def main(cfg: PretrainExperiment, resume, device):
         # 断点续训，读取训练中断前的模型、优化器、train loader 的 state_dict
         path = os.path.join(cfg.run.ckpt_dir, "latest.pt")
         start_step = load_checkpoint(path, m, optimizer, cfg.train.optimizer, loader, device)
-    if layout.dp_size > 1:
+    if layout.dp_size > 1 and tp_size == 1 and pp_size == 1:
+        # 纯 DDP
         if cfg.parallel.zero_stage == 2:
             # ZeRO-2 不能用 DDP 包
             broadcast_params(m)

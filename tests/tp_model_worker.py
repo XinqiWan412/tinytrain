@@ -4,8 +4,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import copy, torch
 import torch.distributed as dist
 from model import ModelConfig, ModelForCausalLM
-from parallel.tp import TPOptimizer, apply_tp, gather_full_state_dict, load_full_state_dict
+from parallel.tp import apply_tp, gather_full_state_dict, load_full_state_dict
 from parallel.dist_utils import setup, cleanup, get_layout, get_rank, get_tp_group, init_parallel
+from parallel.optimizer import ParallelOptimizer
 
 
 setup()
@@ -58,16 +59,16 @@ load_full_state_dict(tp2, full_sd)
 for k, _ in full_sd.items():
     assert torch.equal(tp.state_dict()[k], tp2.state_dict()[k])
 
-# 检查包了 TPOptimizer 后的梯度
+# 检查包了 ParallelOptimizer 后的梯度
 full_opt = torch.optim.SGD(full.parameters(), lr=0.1)
-tp_opt = TPOptimizer([{"params": list(tp.parameters())}], torch.optim.SGD, lr=0.1)
+tp_opt = ParallelOptimizer([{"params": list(tp.parameters())}], torch.optim.SGD, lr=0.1)
 tp_opt.reduce_grads()
 full_params = dict(full.named_parameters())
 for name, p in tp.named_parameters():
     if getattr(p, "tp_sum_grad", False):
         check(name, p.grad, full_params[name].grad)
 
-# 检查包了 TPOptimizer 后的 norm
+# 检查包了 ParallelOptimizer 后的 norm
 norm_full = torch.nn.utils.clip_grad_norm_(full.parameters(), 0.1)
 norm_tp = tp_opt.clip_grad_norm_(tp.parameters(), 0.1)
 check("总范数", norm_tp, norm_full)
@@ -86,7 +87,7 @@ for name, p in tp.named_parameters():
 
 opt_sd = tp_opt.state_dict()
 if rank == 0:
-    assert opt_sd["world_size"] == 2 and len(opt_sd["per_rank"]) == 2
+    assert opt_sd["tp_size"] == 2 and opt_sd["dp_size"] == 1 and opt_sd["pp_size"] == 1 and len(opt_sd["per_rank"]) == 2
 
 
 print(f"rank {rank} OK")
