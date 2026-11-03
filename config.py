@@ -58,12 +58,19 @@ class ParallelConfig:
 
 
 @dataclass
+class PerfConfig:
+    peak_tflops: float = 85.7  # 本机 4070 Ti Super 上 cuBLAS bf16 实测的值，换卡时要改
+    profile: bool = False
+
+
+@dataclass
 class PretrainExperiment:
     model: ModelConfig 
     data: DataConfig
     train: TrainConfig
     run: RunConfig
     parallel: ParallelConfig
+    perf: PerfConfig
 
 
 @dataclass

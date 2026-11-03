@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import math
 import model
+from model import estimate_flops_per_token, ModelForCausalLM
 
 
 def test_rmsnorm():
@@ -159,3 +160,13 @@ def test_param_count():
     m = model.ModelForCausalLM(config)
     assert sum(p.numel() for p in m.parameters()) == model_total
     
+
+def test_flops_per_token(tiny_config):
+    model = ModelForCausalLM(tiny_config)
+    L = tiny_config.num_hidden_layers
+    H = tiny_config.num_attention_heads
+    dh = tiny_config.head_dim
+    T = tiny_config.max_seq_len
+    n = sum(m.weight.numel() for m in model.modules() if isinstance(m, nn.Linear))
+    assert estimate_flops_per_token(tiny_config, T) == 6*n + 12*L*H*dh*T
+

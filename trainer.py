@@ -1,9 +1,8 @@
-from numpy import broadcast
 import math, collections, torch, os, time, contextlib
 from logger import log
 from dataclasses import asdict
 from torch.nn.parallel import DistributedDataParallel as DDP
-from parallel.dist_utils import is_main, all_reduce_mean
+from parallel.dist_utils import get_rank, get_world_size, is_main, all_reduce_mean
 from parallel.fsdp import get_full_state
 from parallel.pp import broadcast_from_last, gpipe_step, is_pp_model, one_f_one_b_step
 from parallel.tp import gather_full_state_dict, is_tp_model
@@ -46,84 +45,125 @@ class Trainer:
         self.raw_model = model.module if self.is_ddp else model
         self.is_tp = is_tp_model(self.raw_model)
         self.is_pp = is_pp_model(self.raw_model)
+        self.flops_per_token = getattr(self.task, "flops_per_token", None)
+        perf = getattr(config, "perf", None)
+        self.peak_flops = perf.peak_tflops * 1e12 if perf is not None else None
+        self.profile = perf.profile if perf is not None else False
+        self.trace_path = os.path.join(
+            os.path.dirname(config.run.log),
+            f"trace_rank{get_rank()}.json"
+        ) if self.profile else None
+
 
     def fit(self, start_step=0):
         records = collections.defaultdict(list)  # 记录返回值
         self._eval(start_step)  # 开始前的 eval
 
-        for step in range(start_step, self.train_config.max_steps):
-            t0 = time.perf_counter()
-            # 拿数据
-            parts, step_extra = self.task.get_parts(step)
-            self.model.train()
-            # 清梯度
-            self.optimizer.zero_grad()
-            loss_accum = 0.0
-            part_extra_acc = {}
-            if self.is_pp:
-                step_fn = one_f_one_b_step if self.config.parallel.pp_schedule == "1f1b" else gpipe_step
-                loss_accum = step_fn(self.raw_model, parts)
-                loss_accum = broadcast_from_last(self.raw_model, loss_accum)
-            else:
-                # 前向反向
-                for i, part in enumerate(parts):
-                    # 只在最后一个 part 同步梯度
-                    if self.is_ddp and i < len(parts) - 1:
-                        sync_ctx = self.model.no_sync()
-                    else:
-                        sync_ctx = contextlib.nullcontext()
-                    if self.is_fsdp:
-                        self.model.set_requires_gradient_sync(i == len(parts) - 1)
-                    with sync_ctx:
-                        loss, part_extra = self.task.loss(part)
-                        loss.backward()
-                    loss_accum += loss.detach()
-                    # 存额外参数，如 GRPO 的 kl
-                    for k, v in part_extra.items():
-                        part_extra_acc[k] = part_extra_acc.get(k, 0.0) + v
-            loss_accum = all_reduce_mean(loss_accum)  # step_extra, part_extra 没有跨进程平均，目前只有预训练用 DDP，没有额外数字
-            # 梯度裁剪
-            if hasattr(self.optimizer, "reduce_grads"):
-                self.optimizer.reduce_grads()  # 梯度规约
-            if hasattr(self.optimizer, "clip_grad_norm_"):
-                norm = self.optimizer.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
-            else:
-                norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
-            # 设学习率
-            lr = get_lr(step, self.train_config)
-            set_lr(self.optimizer, lr)
-            # step
-            self.optimizer.step()
+        # 建 profiler
+        if self.profile:
+            from torch.profiler import ProfilerActivity
+            from profiling import make_trace_handler, WAIT, WARMUP, ACTIVE
+            # 检查剩余步数够不够做 profile
+            remaining = self.train_config.max_steps - start_step
+            if remaining < WAIT + WARMUP + ACTIVE:
+                raise ValueError(
+                    f"profiler 需要 {WAIT + WARMUP + ACTIVE} 步才能走完，"
+                    f"但剩余只有 {remaining} 步，不会输出任何 trace"
+                )
+            # 这里是真的创建 prof_ctx
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            dt = t1 - t0
-            # 记录
-            loss_value = loss_accum.item()
-            if hasattr(norm, "full_tensor"):
-                norm = norm.full_tensor()
-            norm_value = norm.item()
-            extras = {}
-            for k, v in {**step_extra, **part_extra_acc}.items():
-                extras[k] = float(v)
-            records["loss"].append(loss_value)
-            records["norm"].append(norm_value)
-            for k, v in extras.items():
-                records[k].append(v)
-            # 打印 log
-            if step % self.train_config.log_interval == 0 or step == self.train_config.max_steps - 1:
-                tmp = []
+            prof_ctx = torch.profiler.profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                schedule=torch.profiler.schedule(
+                    wait=WAIT, warmup=WARMUP, active=ACTIVE, repeat=1
+                ),
+                on_trace_ready=make_trace_handler(self.trace_path),
+            )
+        else:
+            prof_ctx = contextlib.nullcontext()
+
+        with prof_ctx as prof:
+            for step in range(start_step, self.train_config.max_steps):
+                t0 = time.perf_counter()
+                # 拿数据
+                parts, step_extra = self.task.get_parts(step)
+                self.model.train()
+                # 清梯度
+                self.optimizer.zero_grad()
+                loss_accum = 0.0
+                part_extra_acc = {}
+                if self.is_pp:
+                    step_fn = one_f_one_b_step if self.config.parallel.pp_schedule == "1f1b" else gpipe_step
+                    loss_accum = step_fn(self.raw_model, parts)
+                    loss_accum = broadcast_from_last(self.raw_model, loss_accum)
+                else:
+                    # 前向反向
+                    for i, part in enumerate(parts):
+                        # 只在最后一个 part 同步梯度
+                        if self.is_ddp and i < len(parts) - 1:
+                            sync_ctx = self.model.no_sync()
+                        else:
+                            sync_ctx = contextlib.nullcontext()
+                        if self.is_fsdp:
+                            self.model.set_requires_gradient_sync(i == len(parts) - 1)
+                        with sync_ctx:
+                            loss, part_extra = self.task.loss(part)
+                            loss.backward()
+                        loss_accum += loss.detach()
+                        # 存额外参数，如 GRPO 的 kl
+                        for k, v in part_extra.items():
+                            part_extra_acc[k] = part_extra_acc.get(k, 0.0) + v
+                loss_accum = all_reduce_mean(loss_accum)  # step_extra, part_extra 没有跨进程平均，目前只有预训练用 DDP，没有额外数字
+                # 梯度裁剪
+                if hasattr(self.optimizer, "reduce_grads"):
+                    self.optimizer.reduce_grads()  # 梯度规约
+                if hasattr(self.optimizer, "clip_grad_norm_"):
+                    norm = self.optimizer.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
+                else:
+                    norm = torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.train_config.grad_clip)
+                # 设学习率
+                lr = get_lr(step, self.train_config)
+                set_lr(self.optimizer, lr)
+                # step
+                self.optimizer.step()
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                dt = t1 - t0
+                # 记录
+                loss_value = loss_accum.item()
+                if hasattr(norm, "full_tensor"):
+                    norm = norm.full_tensor()
+                norm_value = norm.item()
+                extras = {}
+                for k, v in {**step_extra, **part_extra_acc}.items():
+                    extras[k] = float(v)
+                records["loss"].append(loss_value)
+                records["norm"].append(norm_value)
                 for k, v in extras.items():
-                    fmt = self.log_formats.get(k, ".4g")
-                    tmp.append(f", {k}:{v:{fmt}}")
-                extra_text = "".join(tmp)
-                tok_text = f", tok/s:{self.tokens_per_step/dt:.0f}" if self.tokens_per_step is not None else ""
-                log(f"step:{step}, loss:{loss_value:.4f}, norm:{norm_value:.4f}, lr:{lr:.4e}{extra_text}, dt:{dt*1000:.1f}ms{tok_text}")
-            # 定期 eval
-            if step == self.train_config.max_steps - 1:
-                self._eval(step + 1, final=True)  # 最后一步，final = True
-            elif (step + 1) % self.train_config.eval_interval == 0:
-                self._eval(step + 1)
+                    records[k].append(v)
+                # 打印 log
+                if step % self.train_config.log_interval == 0 or step == self.train_config.max_steps - 1:
+                    tmp = []
+                    for k, v in extras.items():
+                        fmt = self.log_formats.get(k, ".4g")
+                        tmp.append(f", {k}:{v:{fmt}}")
+                    extra_text = "".join(tmp)
+                    tok_text = f", tok/s:{self.tokens_per_step/dt:.0f}" if self.tokens_per_step is not None else ""
+                    if self.flops_per_token is not None and self.peak_flops is not None and self.tokens_per_step is not None:
+                        mfu = self.flops_per_token * self.tokens_per_step / dt / (self.peak_flops * get_world_size())
+                        mfu_text = f", mfu:{mfu*100:.1f}%"
+                    else:
+                        mfu_text = ""
+                    log(f"step:{step}, loss:{loss_value:.4f}, norm:{norm_value:.4f}, lr:{lr:.4e}{extra_text}, dt:{dt*1000:.1f}ms{tok_text}{mfu_text}")
+                if prof is not None:
+                    prof.step()
+                # 定期 eval
+                if step == self.train_config.max_steps - 1:
+                    self._eval(step + 1, final=True)  # 最后一步，final = True
+                elif (step + 1) % self.train_config.eval_interval == 0:
+                    self._eval(step + 1)
         return dict(records)
 
     

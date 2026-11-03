@@ -182,3 +182,19 @@ def load_model(path, device):
     model.load_state_dict(ckpt["model"])
     model.to(device)
     return model
+
+
+def estimate_flops_per_token(config: ModelConfig, T):
+    D = config.hidden_size
+    L = config.num_hidden_layers
+    H = config.num_attention_heads
+    H_kv = config.num_key_value_heads
+    dh = config.head_dim
+    I = config.intermediate_size
+    V = config.vocab_size
+
+    matmul_params_per_layer = D*H*dh + 2*D*H_kv*dh + H*dh*D + 3*D*I  # 每层矩阵乘的参数量
+    N = L * matmul_params_per_layer + D * V  # L 层，再加 lm_head
+    # 矩阵乘是 6NT，注意力是 6LT²d，这里 12 是计算 mfu 的行业惯例，不扣 causal mask 省下的一半
+    return 6*N + 12*L*H*dh*T
+

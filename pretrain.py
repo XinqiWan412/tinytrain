@@ -16,6 +16,7 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from parallel.dist_utils import all_gather_list, broadcast_params, init_parallel, setup, cleanup, get_rank, get_world_size, all_reduce_mean
 from parallel.zero import ZeroOptimizer
 from parallel.fsdp import load_full_state, shard_model
+from model import estimate_flops_per_token
 
 
 class PretrainTask:
@@ -30,6 +31,8 @@ class PretrainTask:
         assert global_batch_size % (B*T*W) == 0
         self.grad_accum_steps = global_batch_size // (B*T*W)
         self.tokens_per_step = B*T*self.grad_accum_steps*W
+        config = getattr(model, "module", model).config
+        self.flops_per_token = estimate_flops_per_token(config, T)
 
     def get_parts(self, step):
         res = []
