@@ -140,6 +140,7 @@ def get_layout():
 def get_tp_group():
     if _tp_group is None:
         raise RuntimeError("先调用 init_parallel，且 tp_size > 1")
+    return _tp_group
 
 
 def embed_group_ranks(world_size, tp_size, pp_size):
@@ -157,7 +158,6 @@ def get_embed_group():
     if _embed_group is None:
         raise RuntimeError("先调用 init_parallel，且 pp_size > 1")
     return _embed_group
-    return _tp_group
 
 
 def get_dp_group():
