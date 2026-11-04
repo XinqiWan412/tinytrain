@@ -63,6 +63,8 @@ class PerfConfig:
     profile: bool = False
     compile: bool = False
     enable_gqa: bool = False
+    ce_chunk_size: int = 0
+    act_ckpt: bool = False
 
 
 @dataclass

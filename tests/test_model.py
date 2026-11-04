@@ -199,3 +199,55 @@ def test_enable_gqa_matches(tiny_config):
     for g1, g2 in zip(grads, grads2):
         assert torch.allclose(g1, g2, atol=1e-6)
     
+
+def test_chunked_ce_matches(tiny_config):
+    model = ModelForCausalLM(tiny_config)
+    x = torch.randint(0, model.config.vocab_size, (2, 16))
+    targets = torch.randint(0, model.config.vocab_size, (2, 16))
+    # 默认跑一遍，存梯度
+    logits, loss = model(x, targets)
+    loss.backward()
+    grads = []
+    for p in model.parameters():
+        grads.append(p.grad.detach().clone())
+    
+    # chunked_ce 打开，再跑一遍
+    model.zero_grad()
+    model.ce_chunk_size = 10
+    logits2, loss2 = model(x, targets)
+    loss2.backward()
+    grads2 = []
+    for p in model.parameters():
+        grads2.append(p.grad.detach().clone())
+    
+    # 验证 logits 和 grads 相等
+    assert torch.allclose(loss, loss2, atol=1e-6)
+    for g1, g2 in zip(grads, grads2):
+        assert torch.allclose(g1, g2, atol=1e-6)
+
+
+def test_act_ckpt_matches(tiny_config):
+    model = ModelForCausalLM(tiny_config)
+    x = torch.randint(0, model.config.vocab_size, (2, 16))
+    targets = torch.randint(0, model.config.vocab_size, (2, 16))
+    # 默认跑一遍，存梯度
+    logits, loss = model(x, targets)
+    loss.backward()
+    grads = []
+    for p in model.parameters():
+        grads.append(p.grad.detach().clone())
+    
+    # activation checkpointing 打开，再跑一遍
+    model.zero_grad()
+    model.model.act_ckpt = True
+    logits2, loss2 = model(x, targets)
+    loss2.backward()
+    grads2 = []
+    for p in model.parameters():
+        grads2.append(p.grad.detach().clone())
+    
+    # 验证 logits 和 grads 相等
+    assert torch.equal(loss, loss2)
+    for g1, g2 in zip(grads, grads2):
+        assert torch.equal(g1, g2)
+

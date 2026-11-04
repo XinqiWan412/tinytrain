@@ -86,7 +86,7 @@ max_steps = 2000"""
 def test_all_configs_load():
     path = Path(__file__).parent.parent / "configs"
     config_paths = list(path.rglob("*.toml"))
-    assert len(config_paths) == 8
+    assert len(config_paths) == 9
     for config_path in config_paths:
         if config_path.stem.startswith("pretrain"):
             load_config(config_path, PretrainExperiment)

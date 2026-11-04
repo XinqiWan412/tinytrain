@@ -1,0 +1,13 @@
+[train]
+optimizer = "adamw"
+
+[data]
+B = 32
+
+[perf]
+compile = true
+enable_gqa = true
+
+[run]
+ckpt_dir = "checkpoints/adamw_112m_fast"
+log = "logs/adamw_112m_fast/pretrain.log"

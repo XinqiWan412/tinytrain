@@ -2,6 +2,7 @@ from dataclasses import dataclass
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
 
 
 @dataclass
@@ -139,14 +140,19 @@ class Model(nn.Module):
         cos, sin = precompute_rope(config.head_dim, config.max_seq_len, config.rope_theta)
         self.register_buffer('cos', cos, persistent=False)
         self.register_buffer('sin', sin, persistent=False)
+        self.act_ckpt = False
     
     def forward(self, input_ids):
         B, T = input_ids.shape
         assert T <= self.config.max_seq_len, f"in Model.forward, T={T} > max_seq_len={self.config.max_seq_len}"
         x = self.embed_tokens(input_ids)  # (B, T, D)
         cos, sin = self.cos[:T], self.sin[:T]
-        for block in self.layers:
-            x = block(x, cos, sin)
+        if self.act_ckpt and torch.is_grad_enabled():
+            for block in self.layers:
+                x = checkpoint(block, x, cos, sin, use_reentrant=False)
+        else:
+            for block in self.layers:
+                x = block(x, cos, sin)
         x = self.norm(x)
         return x
 
@@ -160,21 +166,44 @@ class ModelForCausalLM(nn.Module):
         self.apply(self._init_weights)
         if config.tie_word_embeddings:
             self.lm_head.weight = self.model.embed_tokens.weight
+        self.ce_chunk_size = 0
     
     def _init_weights(self, module):
         std = 0.02
         if isinstance(module, nn.Linear) or isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+
+    def _chunk_ce(self, x_c, t_c):
+        logits = self.lm_head(x_c)
+        return F.cross_entropy(logits, t_c, reduction="sum")
     
     def forward(self, input_ids, targets=None):
         x = self.model(input_ids)  # (B, T, D)
-        logits = self.lm_head(x)  # (B, T, V)
-        B, T, V = logits.shape
-        if targets is not None:
-            loss = F.cross_entropy(logits.view(B*T, V), targets.view(B*T))
+        B, T = input_ids.shape[:2]
+        if targets is None or self.ce_chunk_size == 0:
+            # 不开启分块 ce
+            logits = self.lm_head(x)  # (B, T, V)
+            V = logits.shape[-1]
+            if targets is not None:
+                loss = F.cross_entropy(logits.view(B*T, V), targets.view(B*T))
+            else:
+                loss = None
+            return logits, loss
         else:
-            loss = None
-        return logits, loss
+            # 开启分块 ce
+            N = B*T
+            D = x.shape[-1]
+            x = x.view(N, D)
+            targets = targets.view(N,)
+            x_cs = x.split(self.ce_chunk_size)
+            t_cs = targets.split(self.ce_chunk_size)
+            loss_accum = torch.zeros((), device=x.device, dtype=torch.float32)
+            for x_c, t_c in zip(x_cs, t_cs):
+                loss = checkpoint(self._chunk_ce, x_c, t_c, use_reentrant=False)
+                loss_accum = loss_accum + loss
+            loss_accum = loss_accum / (targets != -100).sum()
+            return None, loss_accum
+
 
 
 def load_model(path, device):
