@@ -208,7 +208,7 @@ def main(cfg: PretrainExperiment, resume, device):
         m = split_model(m, layout.pp_rank, cfg.parallel.pp_first_stage_layers)
         log(f"pp_size={pp_size}: 模型已切分，本卡第 {layout.pp_rank} 段，层 {list(m.pp_layers)}")
     m.to(device)
-    # 启动各种配置，tp, ZeRO, GQA, activation checkpointing, chunked ce, compile
+    # 启动各种配置，tp, ZeRO, GQA, activation checkpointing, chunked ce, compile, attn_impl
     if tp_size > 1:
         m = apply_tp(m)
         log(f"tp_size={layout.tp_size}: model 已切分")
@@ -223,6 +223,12 @@ def main(cfg: PretrainExperiment, resume, device):
         for mod in m.modules():
             if isinstance(mod, model.Model):
                 mod.act_ckpt = True
+    if cfg.perf.attn_impl not in ("sdpa", "triton"):
+        raise ValueError(f"attn_impl 应该是 sdpa 或 triton，当前 attn_impl:{cfg.perf.attn_impl}")
+    else:
+        for mod in m.modules():
+            if isinstance(mod, model.Attention):
+                mod.attn_impl = cfg.perf.attn_impl
     m.ce_chunk_size = cfg.perf.ce_chunk_size
     if cfg.perf.compile:
         if world_size > 1:
