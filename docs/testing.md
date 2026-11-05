@@ -2,7 +2,7 @@
 
 ## 运行
 
-- `pytest -v`：78 个快测试，约 170 秒，不需要数据
+- `pytest -v`：89 个快测试，约 170 秒，不需要数据；其中 test_flash_attn.py 的 7 个需要 GPU，没有 CUDA 时自动跳过
 - `pytest -m slow -v`：6 个慢测试。2 个需要原始数据；4 个是 3D 的两两组合和续训，不需要数据，约 30 秒
 - `pytest -m "" -v`：全部跑
 - pytest.ini 设了测试目录和 pythonpath，默认跳过标了 slow 的测试
@@ -56,6 +56,14 @@ GPipe 与 1F1B 要求逐位相同，是因为两者之间最可能出的错正�
 
 CPU 上的多进程测试有两件事测不到。一是 autocast 在 CPU 上不生效，测不到 GPU 上两段之间传的激活是不是 fp32、和接收的缓冲区对不对得上，上云前另外在单卡 GPU 上确认过。二是 gloo 对小消息可能先缓冲，1F1B 里两段同时用阻塞的方式发送，在 CPU 上不一定卡住，所以收发要打包提交（batch_isend_irecv）这一点只能靠分析，测试保证不了。
 
+### 性能优化的开关
+
+- 每个开关默认关闭，原有基线一个都不用动。能精确比较的都写成开关前后的对拍：GQA、分块 CE 用 allclose（CPU、fp32，1e-6）；activation checkpointing 要求逐位相同，因为重算走的是完全相同的运算
+- compile 会改变数值（300 步后 val loss 差约 7e-4），不写成单元测试，在 GPU 上跑 300 步对比 loss；compile 下是否断图用 TORCH_LOGS="graph_breaks,recompiles" 检查。自写 FA 的测试里用 fullgraph=True，只要断图就直接报错
+- 自写 FA 对 fp32 的 SDPA 留 3e-2 的容差（输入是 bf16）；经过 autograd 与直接调用 launcher 之间要求逐位相同，反向不用 atomic，结果是确定的
+- 开关是模块上的属性时，测试要设到真正读它的模块上：act_ckpt 在里面的 Model 上，enable_gqa、attn_impl 在每个 Attention 上。设到外层模型上，Python 不会报错，两次跑的都是原来的路径，怎么改坏都通过
+- 比较整模型时比 logits，不比 loss：刚初始化时 logits 都接近 0，loss 约等于 ln(词表大小)，注意力算错 loss 也几乎不动
+
 ## 临时改坏记录
 
 改坏一处，看哪些测试失败，用来确认测试真能抓到错误。
@@ -87,6 +95,13 @@ CPU 上的多进程测试有两件事测不到。一是 autocast 在 CPU 上不�
 | PP 的 Muon 分组不认 pp_shared | 只用小配置手动对照过，没有跑测试：第 0 步相同，从第 1 步起 loss 与单卡差 1e-3～1e-2，而且越来越大，每步耗时约变为 4 倍 |
 | ParallelOptimizer 的 DP 同步改成在全局组求平均（DDP 的默认做法） | DP2×TP2 等价测试在 val_loss 上失败（5.56731 → 5.56788，相对差约 1e-4，是容差的 10 倍），训练不报错。不要在 3D 下这样改：两段的参数个数和形状不同，全局组上的 all-reduce 会一直卡到超时 |
 | get_tp_group 漏写 return（实际发生过） | TP 单独用的测试全部通过；DP2×TP2 等价测试失败（val_loss 相对差约 4e-4，训练前的 eval 就已不同）；TP2×PP2 和 3D 卡到超时。布局测试只测纯函数，抓不到 |
+| 每 token 计算量的公式漏掉 lm_head（D×V）那一项 | 与实际模型里 nn.Linear 权重个数的对照失败 |
+| enable_gqa 关闭时的 repeat_interleave 换成 repeat | GQA 开关对拍失败 |
+| 分块 CE 每块改用 mean | 分块 CE 对拍失败（loss 5.5743 vs 0.7007），最后一块只有 2 行却和其他块权重相同 |
+| checkpoint 前把 x 改成 x.detach() | 初版测试（开关设在外层模型上）照样通过；改正后失败，第 0～10 层的梯度是 None |
+| 自写 FA 的 dkdv 组内循环只跑 1 次 | G=4 的两组在 dk、dv 上失败，G=1 那组通过 |
+| custom op 的 fake 里 M 的 dtype 写成 bf16 | 只有 opcheck 失败（test_faketensor），其余照样通过 |
+| Attention 的 triton 分支把 k、v 传反 | 初版比较 loss 的测试照样通过；改为比较 logits 后 96% 的元素不对，最大差 1.2 |
 
 从这些记录看出的规律：
 
@@ -98,11 +113,12 @@ CPU 上的多进程测试有两件事测不到。一是 autocast 在 CPU 上不�
 - 只差末位的错误（比如反向顺序不一致）只有要求逐位相同的测试能抓到。两种实现本应算同一个东西时，就要求逐位相同，不留容差
 - CPU 上的多进程测试测不到只在 GPU 上才有的情况（autocast 下的数据类型、NCCL 收发互相等住），要单独检查，或者靠分析
 - 用错进程组的错，只有在组和全局组不同的配置下才测得出来；组合测试不能只测"每种并行单独用"。组用错时多进程测试可能直接卡死，所以 run_subprocess 要设超时，超时后还要清掉残留的 worker
+- 测试通过不代表它真的在测：开关没设到起作用的模块上，或者比较的量对错误不敏感（刚初始化时的 loss），怎么改坏都能通过。这一轮有两个测试都是在临时改坏时才发现不起作用的，所以每个新测试都要改坏一次
 
 ## 各测试文件
 
 - `conftest.py`：公共 fixture。tiny_config（2 层、hidden 64、词表 256 的小模型配置）；sft_config（在 tiny_config 基础上把词表改成 32768、max_seq_len 改成 64，供用真分词器的 SFT / GRPO 测试使用）；make_data_dir（在临时目录造随机 token 的 .bin 分片和 meta.json，可指定片数和每片 token 数）
-- `test_model.py`：模型各模块、参数量公式、初始化 loss
+- `test_model.py`：模型各模块、参数量公式、初始化 loss、每 token 计算量公式；enable_gqa、分块 CE 开关前后 logits / loss 与梯度 allclose，activation checkpointing 开关前后梯度逐位相同
 - `test_tokenizer.py`：分词器和 BPE 训练；2 个慢测试是 1000 篇文档的编解码往返、快慢两版 BPE 训练 1000 次合并的对拍
 - `test_sft_data.py`：train / test 切分，构建 x, y 时只有答案和 `<|im_end|>` 参与 loss
 - `test_dataloader.py`：换片、state_dict 往返、按进程跳着读（world_size=2 的两个 loader 轮流取，与单进程连续取逐批相同）
@@ -118,6 +134,7 @@ CPU 上的多进程测试有两件事测不到。一是 autocast 在 CPU 上不�
 - `test_tp.py`：并行布局的手算例子；用 tp_worker.py、tp_model_worker.py 做层级和整模型对照；torchrun 1 进程与 2 进程 TP 比较 val_loss 和 final.pt（参数 1e-4）、load_model 读回；两进程中途续训逐位相同；muon 配 tp_size=2、TP 配 ZeRO 时报错。compare_state_dicts 失败时报出超标参数的个数和最大差所在的参数
 - `test_pp.py`：并行布局（含 PP 编号）和 PP 组、embedding 组组员的手算例子；单进程里检查切分（两段的键不重叠、合起来等于完整模型，值不变，层名保持全局编号）、两段前向的 loss、模拟交接后各参数的梯度，都与完整模型逐位相同；用 pp_worker.py 对照 GPipe、1F1B 和完整模型；torchrun 1 进程与 2 进程 PP 比较 val_loss 和 final.pt（AdamW 1e-5、Muon 1e-4），检查日志里确实切分了、load_model 能读回；GPipe 与 1F1B 的完整训练逐位相同；两进程中途续训逐位相同
 - `test_3d.py`：三种组（TP、DP、PP）和 embedding 组的成员，8 卡时与手算的表一致，几种布局下每种组覆盖每张卡恰好一次、任意两种组的交集只有自己；torchrun 1 进程对照 DP2×TP2、DP2×PP2、TP2×PP2、DP2×TP2×PP2 比较 val_loss 和 final.pt（参数 1e-4），并检查 checkpoint 里 tp、pp、dp 的大小；3D 中途续训逐位相同。只有 3D 等价测试是快测试
+- `test_flash_attn.py`：需要 GPU。自写 FA 与 fp32 SDPA 对拍（G=4、T=512；G=4、T=500；G=1）；opcheck 前向、反向两个 custom op；经过 autograd 与直接调用 launcher 逐位相同；compile fullgraph 下前向加反向不断图、梯度与不编译时一致；整模型 attn_impl=triton 与 sdpa 的 logits 一致
 - `zero2_worker.py`：不是测试文件，由 test_zero.py 用 torchrun 起两个进程运行
 - `tp_worker.py`：不是测试文件，两进程上完整 MLP 与切开的 MLP 比较输出、输入梯度、各卡权重梯度
 - `tp_model_worker.py`：不是测试文件，两进程上整模型对照：各参数梯度（q_norm、k_norm 两卡求和后）、拼回和切回、TPOptimizer 的梯度求和、裁剪总范数、一步 SGD 更新

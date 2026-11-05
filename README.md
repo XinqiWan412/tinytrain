@@ -2,7 +2,7 @@
 
 从零手写的 LLM 训练全流程：预训练 → SFT → GRPO。模型结构参考 Qwen3-0.6B，模型、数据加载、训练循环、对话模板、GRPO 都是自己实现的，没有用 transformers / trl。
 
-在单张 RTX 4070 Ti Super（16GB）上先用 1150 万参数的小模型跑通全流程，再扩大到 1.12 亿参数，对比 AdamW 和 Muon 两种优化器；导出 HF 格式后与 transformers 对拍；预训练支持 DDP、手写的 ZeRO-1 / ZeRO-2、FSDP2（fully_shard），以及手写的张量并行（TP=2）和流水线并行（PP=2，GPipe / 1F1B），在 4×RTX 4090、4×A100 和 2×A100 上测过。
+在单张 RTX 4070 Ti Super（16GB）上先用 1150 万参数的小模型跑通全流程，再扩大到 1.12 亿参数，对比 AdamW 和 Muon 两种优化器；导出 HF 格式后与 transformers 对拍；预训练支持 DDP、手写的 ZeRO-1 / ZeRO-2、FSDP2（fully_shard），以及手写的张量并行（TP=2）和流水线并行（PP=2，GPipe / 1F1B），在 4×RTX 4090、4×A100 和 2×A100 上测过。单卡上做了性能优化：torch.compile、SDPA 的 GQA、分块 lm_head + CE、activation checkpointing，以及把自写的 Triton FlashAttention 注册成 custom op 接进模型，MFU 从 43% 提高到 74%。
 
 ## 结果
 
@@ -45,7 +45,21 @@
 - 1F1B 与 GPipe 速度相同、训练结果逐位相同，显存却低得多：GPipe 要同时存 8 份激活，第二段每份还要多存约 1.7 GB 的 logits 等中间结果
 - TP 只快 11%：lm_head、loss 和各层的小操作两张卡各算一遍，每份数据 48 次 all-reduce 又没和计算重叠
 
-各版本的完整表格和分析见 [docs/results.md](docs/results.md)，多卡各做法的实现见 [docs/parallel.md](docs/parallel.md)。
+### 单卡性能优化：RTX 4070 Ti Super，AdamW 路线
+
+| 配置 | 每步时间 | MFU | 峰值显存（allocated） |
+| --- | --- | --- | --- |
+| eager，B=16（原来的做法） | 1,335 ms | 43.0% | 9,959 MiB |
+| torch.compile，B=16 | 796 ms | 72.1% | 6,728 MiB |
+| compile + GQA，B=32（pretrain_fast.toml） | 774 ms | 74.1% | 10,884 MiB |
+| 同上，注意力换成自写 Triton FA | 793 ms | 72.3% | 11,266 MiB |
+
+- 快 1.72 倍，完整预训练按每步时间估算从约 12.6 小时缩到约 7.3 小时。300 步内 compile 与 eager 的 val loss 相差 0.0007
+- 矩阵乘在 eager 下就已接近峰值，MFU 低是因为每层一串逐元素小 kernel（RMSNorm、RoPE、SiLU、残差、类型转换）合计比矩阵乘还多；compile 把它们从 712 ms 融合到 184 ms
+- 分块 CE 和 activation checkpointing 在这个模型上都不提速（B=32 时分别慢 4% 和再慢 19%），但开了之后 B=32 只要 4.5 GB，留给以后放大模型
+- 自写 FA 比 SDPA 慢 2.4%，接进来是为了让注意力可以在配置里切换，并验证 custom op 在 compile 下不断图
+
+各版本的完整表格和分析见 [docs/results.md](docs/results.md)，多卡各做法的实现见 [docs/parallel.md](docs/parallel.md)，单卡性能优化见 [docs/perf.md](docs/perf.md)。
 
 ## 快速复现
 
@@ -82,11 +96,15 @@ torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m
 torchrun --standalone --nproc_per_node=2 pretrain.py --config configs/adamw_112m/pretrain.toml --set parallel.pp_size=2 --set parallel.pp_first_stage_layers=7
 torchrun --standalone --nproc_per_node=8 pretrain.py --config configs/adamw_112m/pretrain.toml --set parallel.tp_size=2 --set parallel.pp_size=2 --set parallel.pp_first_stage_layers=7 --set data.eval_steps=24
 
+# 9. 单卡快速预训练：compile + GQA + B=32，约 7.3 小时，训练结果与第 3 步在数值误差内相同
+python pretrain.py --config configs/adamw_112m/pretrain_fast.toml
+
 - Muon 路线把路径里的 adamw_112m 换成 muon_112m
 - 每次运行的参数都在 configs/ 的配置文件里；临时改参数用 `--set 节.键=值`（可写多次），完整配置会打在日志开头并存进 checkpoint
 - 多卡的卡数限制、续训规则、在 CPU 上验证多进程的方法见 [docs/parallel.md](docs/parallel.md)
+- 单卡性能优化的开关都在配置的 `[perf]` 节，默认全部关闭，用法见 [docs/perf.md](docs/perf.md)；`--set perf.profile=true` 会抓 2 步 trace 并打印按类别汇总的 GPU 时间
 
-测试：`pytest -v` 跑 78 个快测试（CPU，约 170 秒，不需要数据），`pytest -m slow -v` 跑 6 个慢测试（2 个需要原始数据，4 个是 3D 的两两组合和续训）。测试怎么设计、临时改坏能被哪些测试抓到，见 [docs/testing.md](docs/testing.md)。
+测试：`pytest -v` 跑 89 个快测试（约 170 秒，不需要数据；其中 7 个自写 FA 的测试需要 GPU，没有 CUDA 时自动跳过），`pytest -m slow -v` 跑 6 个慢测试（2 个需要原始数据，4 个是 3D 的两两组合和续训）。测试怎么设计、临时改坏能被哪些测试抓到，见 [docs/testing.md](docs/testing.md)。
 
 ## 项目结构
 
@@ -106,6 +124,7 @@ torchrun --standalone --nproc_per_node=8 pretrain.py --config configs/adamw_112m
 - `export_hf.py`：导出 HF 格式并与 transformers 对拍
 - `config.py`：配置 dataclass 和 load_config（TOML + `--set`）
 - `logger.py`：日志同时打印并写文件，多进程时只有 0 号进程输出
+- `profiling.py`：torch.profiler 的 trace 导出，以及按类别（矩阵乘、注意力、CE、优化器、其他）汇总每步 GPU 时间
 - `parallel/`
   - `dist_utils.py`：进程组初始化、并行布局（本卡的 DP、TP、PP 编号和三种组）和通信小工具
   - `zero.py`：手写 ZeRO-1 / ZeRO-2（ZeroOptimizer）
@@ -113,7 +132,9 @@ torchrun --standalone --nproc_per_node=8 pretrain.py --config configs/adamw_112m
   - `tp.py`：手写张量并行（f / g、两种并行线性层、apply_tp、按参数名拼回和切回）
   - `pp.py`：手写流水线并行（按段切分模型、两段的前向、GPipe 和 1F1B 调度）
   - `optimizer.py`：TP、PP、3D 共用的优化器包装 ParallelOptimizer（各组里的梯度求和与平均、跨卡求范数）
-- `configs/`：adamw_112m、muon_112m 两条路线，各 4 个配置文件（pretrain、sft、sft_weak、grpo）
+- `kernels/`
+  - `flash_attn.py`：自写 Triton FlashAttention（前向、双 kernel 反向，支持 GQA），注册为 custom op `tinytrain::flash_attn_fwd` / `flash_attn_bwd`
+- `configs/`：adamw_112m、muon_112m 两条路线，各 4 个配置文件（pretrain、sft、sft_weak、grpo）；adamw_112m 另有 pretrain_fast（compile + GQA + B=32）
 - `tests/`：pytest 测试，见 [docs/testing.md](docs/testing.md)
 
 各模块的设计和取舍见 [docs/notes.md](docs/notes.md)。
@@ -132,8 +153,9 @@ torchrun --standalone --nproc_per_node=8 pretrain.py --config configs/adamw_112m
 | v0.8 | FSDP2（fully_shard） |
 | v0.9 | 手写 TP（张量并行）和 PP（流水线并行，GPipe / 1F1B） |
 | v0.10 | 3D 并行（DP×TP×PP；8 卡测速待补） |
-| 下一步 | 性能优化（MFU、torch.profiler、torch.compile、自写 Triton FlashAttention、分块 lm_head + CE、activation checkpointing），在本地单卡上做，最后租 A100 复测 |
-| 之后 | 标准评估（HellaSwag 等零样本任务，用 Qwen3-0.6B base 校准评估流程）→ 读入 Qwen3-0.6B，用 GRPO 在 GSM8K 上训练，在多类数据集上评估提升和遗忘 → 推理框架（KV cache、批量调度，接入 GRPO rollout，与 vLLM 对照）→ 序列打包 + varlen attention |
+| v0.11 | 单卡性能优化：MFU 与 torch.profiler、torch.compile、SDPA 的 GQA、分块 lm_head + CE、activation checkpointing，自写 Triton FlashAttention 注册为 custom op（租 A100 复测待补） |
+| 下一步 | 标准评估（HellaSwag 等零样本任务，用 Qwen3-0.6B base 校准评估流程） |
+| 之后 | 读入 Qwen3-0.6B，用 GRPO 在 GSM8K 上训练，在多类数据集上评估提升和遗忘 → 推理框架（KV cache、批量调度，接入 GRPO rollout，与 vLLM 对照）→ 序列打包 + varlen attention |
 
 可选：两种优化器扫 lr 与 GRPO 多种子、PPO 式 ratio + clip / DAPO、代码类评估（需要执行代码的沙箱）、MoE、GitHub Actions CI、FSDP2 的 MixedPrecisionPolicy。
 

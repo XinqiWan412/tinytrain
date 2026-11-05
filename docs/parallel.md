@@ -319,6 +319,7 @@ FSDP2 把每个矩阵按行切开，step 时每张卡只有几行动量，而 Mu
 - 补测 3D 的 8 卡速度（用 v0.10 标签的代码）
 - 可选：FSDP2 的 MixedPrecisionPolicy，参数以 bf16 收集，这一步的通信量减半，但数值和 autocast 不完全一样，作为单独的实验
 
-## 下一步：性能优化
+## 性能优化
 
-多卡并行到此做完。下一步回到单卡：先用 torch.profiler 看清一步的时间花在哪、算出 MFU，再依次试 torch.compile、把自写的 Triton FlashAttention 注册成 custom op 接进来、分块算 lm_head 和 CE、activation checkpointing，每一项都量一下省了多少时间和显存。这些都在本地单卡上做；做完后租一次 A100，在同一台机器上测优化前后的单卡速度和 MFU，租到多卡时顺便补测 3D。
+单卡性能优化（v0.11）见 [perf.md](perf.md)。torch.compile 目前只支持单卡，和这里各种并行的组合留到以后。
+

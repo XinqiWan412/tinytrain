@@ -1,6 +1,6 @@
 # 结果
 
-各版本的完整结果和分析。各做法的实现和正确性验证见 [parallel.md](parallel.md)，模型结构和超参数见 [notes.md](notes.md)。
+各版本的完整结果和分析。多卡各做法的实现和正确性验证见 [parallel.md](parallel.md)，单卡性能优化见 [perf.md](perf.md)，模型结构和超参数见 [notes.md](notes.md)。
 
 ## 1.12 亿参数全流程：AdamW vs Muon（v0.3）
 
@@ -165,6 +165,41 @@ TP 只支持 AdamW，所以这组也用 AdamW 路线，在 Runpod 上租单机 2
 | 3d_b8 | 2×2×2 | 8 | 48 | 8 | 1/9 |
 
 只租到 4 卡时，先测 dp4、dp2_tp2、dp2_pp2（B=8、eval_steps=48）、tp2_pp2 这几种两两组合。
+
+## 单卡性能优化（v0.11）
+
+本地单张 RTX 4070 Ti Super 16GB，AdamW 路线，预训练前 100 步（compile 与 eager 的 loss 对比跑 300 步）。每步时间取第 10 步起的平均，去掉编译和预热；MFU 按每 token 约 7.5 亿次浮点运算、峰值 85.7 TFLOPS（本机 cuBLAS bf16 实测）算；峰值显存是 max_memory_allocated。eager 基线连跑两次，平均每步时间相差 0.02%。各项的做法和正确性验证见 [perf.md](perf.md)。
+
+| 配置 | B | 每步 | tok/s | MFU | 峰值显存 |
+| --- | --- | --- | --- | --- | --- |
+| eager | 16 | 1,334.9 ms | 49,094 | 43.0% | 9,959 MiB |
+| compile | 16 | 796.2 ms | 82,315 | 72.1% | 6,728 MiB |
+| compile + GQA | 16 | 791.3 ms | 82,822 | 72.5% | 6,445 MiB |
+| compile + GQA | 32 | 774.3 ms | 84,638 | 74.1% | 10,884 MiB |
+| compile + GQA | 64 | OOM | | | |
+| 再加分块 CE（每块 4096 行） | 32 | 807.6 ms | 81,144 | 71.0% | 9,863 MiB |
+| 再加分块 CE | 64 | OOM | | | |
+| 再加分块 CE + checkpointing | 32 | 962.0 ms | 68,123 | 59.6% | 4,492 MiB |
+| 再加分块 CE + checkpointing | 64 | 946.9 ms | 69,214 | 60.6% | 6,670 MiB |
+| compile + GQA，attn_impl=triton | 32 | 793.1 ms | 82,634 | 72.3% | 11,266 MiB |
+
+profile（B=16，每步 GPU 时间按类别汇总）：
+
+| 类别 | eager | compile |
+| --- | --- | --- |
+| 其他（归一化 / 逐元素 / 拷贝） | 712 ms（53%） | 184 ms（23%） |
+| 矩阵乘 | 512 ms（38%） | 511 ms（64%） |
+| 注意力 | 61 ms（5%） | 60 ms（8%） |
+| CE | 36 ms（3%） | 28 ms（4%） |
+| 优化器 | 13 ms（1%） | 13 ms（2%） |
+| 合计 | 1,334 ms | 796 ms |
+
+- 最快的是 compile + GQA + B=32（configs/adamw_112m/pretrain_fast.toml），比 eager 快 1.72 倍。按每步时间估算，v0.3 的完整预训练（34,000 步）从约 12.6 小时缩到约 7.3 小时
+- 矩阵乘在 eager 下就已接近峰值（按 85.7 TFLOPS 算要 516 ms，实测 512 ms），compile 省下的几乎全来自"其他"里的逐元素小 kernel。两种模式下 GPU 都几乎不空闲
+- 数值：compile 与 eager 跑 300 步，第 300 步 val loss 5.9384 / 5.9391，train loss 每步平均差 0.0005；triton 与 sdpa 跑 100 步，val loss 7.2483 / 7.2482
+- 显存账：每 16 条序列的激活约 4,439 MiB，参数、梯度和 Adam 状态约 2,000 MiB，所以不开 checkpointing 时 B=64 约要 19.8 GB
+- 分块 CE 省约 1 GB（一整块 bf16 logits）、慢 34 ms（lm_head 前向多做一遍）；checkpointing 在 B=32 时再省 5.4 GB、慢 154 ms（19%）。两者换来的 B=64 只比 B=32 快 15 ms，所以在 1.12 亿参数上都不提速
+- 自写 Triton FA 慢 19 ms（2.4%），多 382 MiB，原因的推测见 [perf.md](perf.md)
 
 ## 1150 万参数全流程（v0.2）
 
